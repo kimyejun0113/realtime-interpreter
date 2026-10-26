@@ -1,3 +1,4 @@
+import time
 from collections import OrderedDict
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QSettings, Qt, Signal
@@ -7,7 +8,10 @@ from PySide6.QtWidgets import (
     QSizeGrip, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
-HISTORY = 2  # finished sentences kept above the live one
+MAX_ENTRIES = 6      # sentences kept in memory (older ones are forgotten)
+HISTORY_SHOWN = 3    # past translations shown once everyone has had time to read them
+# how long a finished translation stays on screen: base + per character, clamped
+READ_BASE_SEC, READ_SEC_PER_CHAR, READ_MIN_SEC, READ_MAX_SEC = 1.5, 0.08, 3.0, 8.0
 
 # Segoe Fluent Icons (Win11) / Segoe MDL2 Assets (Win10) glyphs
 ICON_PLAY, ICON_PAUSE, ICON_MORE, ICON_CLOSE = "", "", "", ""
@@ -196,28 +200,35 @@ class SubtitleOverlay(QWidget):
     # ---- content -------------------------------------------------------
     def _entry(self, seq: int) -> dict:
         if seq not in self.entries:
-            self.entries[seq] = {"source": "", "translation": "", "done": False}
-            while len(self.entries) > HISTORY + 1:
+            self.entries[seq] = {"source": "", "translation": "", "done": False, "final_at": None}
+            while len(self.entries) > MAX_ENTRIES:
                 self.entries.popitem(last=False)
         return self.entries[seq]
 
-    def _entry_html(self, e: dict, current: bool, source: str, translation: str) -> str:
+    @staticmethod
+    def _read_until(e: dict) -> float:
+        """Until when a finished translation must stay on screen so it can be read."""
+        if not e["done"] or e["final_at"] is None:
+            return float("inf")  # still waiting for its final translation
+        return e["final_at"] + min(READ_MAX_SEC, max(READ_MIN_SEC, READ_BASE_SEC + READ_SEC_PER_CHAR * len(e["translation"])))
+
+    def _history_html(self, e: dict, newest: bool) -> str:
+        # past sentences: translation only, so the space goes to what people actually read
         fs = self.font_size
-        src_size = int(fs * (0.78 if current else 0.56))
-        tr_size = fs if current else int(fs * 0.68)
-        src_color = "rgba(235,235,245,0.75)" if current else "rgba(235,235,245,0.32)"
-        if not current:
-            tr_color = "rgba(255,255,255,0.5)"
-        elif e["done"]:
-            tr_color = "#FFFFFF"
-        else:
-            tr_color = "rgba(255,255,255,0.72)"  # tentative, still being re-translated
-        html = f'<p align="center" style="margin:0 0 3px 0;color:{src_color};font-size:{src_size}px">{_esc(source)}</p>'
+        size, color, weight = (int(fs * 0.85), "rgba(255,255,255,0.9)", 600) if newest else (int(fs * 0.72), "rgba(255,255,255,0.55)", 400)
+        text = _esc(e["translation"]) or '<span style="color:rgba(235,235,245,0.4)">…</span>'
+        return f'<p align="center" style="margin:0 0 8px 0;color:{color};font-size:{size}px;font-weight:{weight}">{text}</p>'
+
+    def _current_html(self, e: dict, source: str, translation: str) -> str:
+        fs = self.font_size
+        html = ""
+        if source:
+            html += (f'<p align="center" style="margin:0 0 3px 0;color:rgba(235,235,245,0.7);'
+                     f'font-size:{int(fs * 0.72)}px">{_esc(source)}</p>')
         if translation:
-            html += (f'<p align="center" style="margin:0 0 10px 0;color:{tr_color};font-size:{tr_size}px;'
-                     f'font-weight:{700 if current else 400}">{_esc(translation)}</p>')
-        else:
-            html += '<p style="margin:0 0 10px 0"></p>'
+            color = "#FFFFFF" if e["done"] else "rgba(255,255,255,0.72)"  # dim = tentative, still changing
+            html += (f'<p align="center" style="margin:0 0 4px 0;color:{color};font-size:{fs}px;'
+                     f'font-weight:700">{_esc(translation)}</p>')
         return html
 
     def _fits(self, html: str) -> bool:
@@ -235,38 +246,41 @@ class SubtitleOverlay(QWidget):
                 "말을 시작하면 여기에 자막이 표시돼요</p>"
             )
             return
+        now = time.monotonic()
         items = list(self.entries.values())
-
-        def build(entries, source=None, translation=None) -> str:
-            parts = []
-            for i, e in enumerate(entries):
-                current = i == len(entries) - 1
-                src = source if current and source is not None else e["source"]
-                tr = translation if current and translation is not None else e["translation"]
-                parts.append(self._entry_html(e, current, src, tr))
-            return "".join(parts)
-
-        # the newest text must always be visible: drop older sentences first...
-        for start in range(len(items)):
-            html = build(items[start:])
-            if self._fits(html):
-                self.body.setText(html)
-                return
-        # ...then show only the tail of a very long current sentence
-        cur = items[-1]
+        cur, history = items[-1], items[:-1]
         src_words, tr_words = cur["source"].split(), cur["translation"].split()
-        while True:
+        while len(history) > HISTORY_SHOWN and now >= self._read_until(history[0]):
+            history.pop(0)
+
+        def build() -> str:
             source = ("… " if len(src_words) < len(cur["source"].split()) else "") + " ".join(src_words)
             translation = ("… " if len(tr_words) < len(cur["translation"].split()) else "") + " ".join(tr_words)
-            html = build([cur], source, translation)
-            if self._fits(html) or (len(src_words) <= 4 and len(tr_words) <= 4):
-                self.body.setText(html)
-                return
-            # trim whichever line is relatively longer, from the front (oldest words)
-            if len(src_words) > 4 and (len(src_words) >= 2 * len(tr_words) or len(tr_words) <= 4):
+            parts = [self._history_html(e, i == len(history) - 1) for i, e in enumerate(history)]
+            return "".join(parts) + self._current_html(cur, source, translation)
+
+        # When space runs out, give up the least useful text first:
+        # 1. past translations that have already been on screen long enough to read
+        # 2. the oldest words of the live English line
+        # 3. the oldest words of the tentative translation
+        # 4. only then past translations people may still be reading
+        while not self._fits(html := build()):
+            read = [e for e in history if now >= self._read_until(e)]
+            if read:
+                history.remove(read[0])
+            elif len(src_words) > 6:
                 src_words = src_words[2:]
-            else:
+            elif not cur["done"] and len(tr_words) > 4:
                 tr_words = tr_words[1:]
+            elif history:
+                history.pop(0)
+            elif len(src_words) > 2:
+                src_words = src_words[1:]
+            elif len(tr_words) > 2:
+                tr_words = tr_words[1:]
+            else:
+                break
+        self.body.setText(html)
 
     def eventFilter(self, obj, event) -> bool:
         # re-fit when the subtitle area itself changes size (it is laid out after the window resizes)
@@ -294,6 +308,7 @@ class SubtitleOverlay(QWidget):
         e = self.entries.get(seq)
         if e:
             e["done"] = True
+            e["final_at"] = time.monotonic()
             if text:
                 e["translation"] = text
             self._render()
