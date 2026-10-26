@@ -52,5 +52,5 @@ def pcm_to_wav(pcm: np.ndarray, sample_rate: int = 16000) -> bytes:
 
 
 class STT:
-    def transcribe(self, pcm: np.ndarray, prompt: str = "") -> Transcript | None:
+    def transcribe(self, pcm: np.ndarray, prompt: str = "", language: str = "") -> Transcript | None:
         raise NotImplementedError

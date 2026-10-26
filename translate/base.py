@@ -4,15 +4,25 @@ from config import lang_name
 
 
 class Translator:
-    def stream(self, text: str, src: str, tgt: str, context: list[tuple[str, str]]) -> Iterator[str]:
+    model: str
+
+    def stream(self, text: str, src: str, tgt: str, context: list[tuple[str, str]], partial: bool = False) -> Iterator[str]:
         raise NotImplementedError
 
 
-def build_messages(text: str, src: str, tgt: str, context: list[tuple[str, str]]) -> list[dict]:
+def build_messages(text: str, src: str, tgt: str, context: list[tuple[str, str]], partial: bool = False) -> list[dict]:
+    if partial:
+        # short prompt: partial updates are frequent, so every token counts
+        system = (
+            f"Live interpreter. Translate the {lang_name(src)} speech fragment (still being spoken, "
+            f"no punctuation) into natural {lang_name(tgt)}. Output only the translation."
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": text}]
+
     system = (
         f"You are a professional simultaneous interpreter translating {lang_name(src)} speech "
         f"into natural, spoken {lang_name(tgt)}.\n"
-        "- The input is a speech-recognition fragment; it may be an incomplete sentence or contain "
+        "- The input is a speech-recognition transcript; it may lack punctuation or contain "
         "recognition errors. Translate what is meant, smoothly, without adding anything.\n"
         "- Output ONLY the translation. No quotes, notes, romanization, or explanations.\n"
         "- Keep proper nouns, product names and numbers accurate."

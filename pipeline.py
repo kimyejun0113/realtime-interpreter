@@ -3,15 +3,19 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from audio.capture import MicCapture
-from audio.segmenter import Segment, VadSegmenter
 from config import Config
-from stt.base import STT, RateLimitError, Transcript, pcm_to_wav
+from quota import QuotaTracker
+from stt.base import RateLimitError, pcm_to_wav
 from stt.groq_stt import GroqSTT
+from stt.streaming import StreamingRecognizer
 from translate.base import Translator
 from translate.openai_compat import GEMINI_BASE, GROQ_BASE, OpenAICompatTranslator
 
@@ -22,17 +26,22 @@ class Events:
     """Callbacks the UI subscribes to. Called from worker threads."""
 
     def __init__(self):
-        self.on_source: Callable[[int, str, str], None] = lambda seq, text, lang: None
-        self.on_partial: Callable[[int, str], None] = lambda seq, text: None
-        self.on_final: Callable[[int, str], None] = lambda seq, text: None
-        self.on_status: Callable[[str], None] = lambda msg: None
+        self.on_live: Callable[[int, str], None] = lambda seq, text: None             # words as they are heard
+        self.on_partial: Callable[[int, str], None] = lambda seq, text: None          # tentative translation
+        self.on_source: Callable[[int, str, str], None] = lambda seq, text, lang: None  # final source text
+        self.on_final: Callable[[int, str], None] = lambda seq, text: None            # final translation
+        self.on_status: Callable[[str, str], None] = lambda msg, kind: None           # kind: live/paused/warn
         self.on_level: Callable[[float], None] = lambda level: None
+        self.on_quota: Callable[[str], None] = lambda text: None
 
 
-def make_translator(cfg: Config) -> Translator:
-    if cfg.translate_provider == "gemini":
-        return OpenAICompatTranslator(GEMINI_BASE, cfg.gemini_api_key, cfg.gemini_model)
-    return OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.translate_model)
+@dataclass
+class Utterance:
+    seq: int
+    text: str
+    lang: str
+    pcm: np.ndarray
+    t_end: float
 
 
 class TranscriptLogger:
@@ -43,25 +52,24 @@ class TranscriptLogger:
         LOG_DIR.mkdir(exist_ok=True)
         self.session = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    def write(self, seg: Segment, tr: Transcript, translation: str, tgt: str, timings: dict) -> None:
+    def write(self, utt: Utterance, source: str, translation: str, tgt: str, timings: dict) -> None:
         record = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "session": self.session,
-            "seq": seg.seq,
-            "src_lang": tr.lang,
+            "seq": utt.seq,
+            "src_lang": utt.lang,
             "tgt_lang": tgt,
-            "source": tr.text,
+            "source": source,
+            "source_local": utt.text,
             "translation": translation,
-            "duration_sec": round(seg.duration, 2),
-            "stt_model": self.cfg.stt_model,
-            "translate_model": self.cfg.gemini_model if self.cfg.translate_provider == "gemini" else self.cfg.translate_model,
+            "duration_sec": round(len(utt.pcm) / 16000, 2),
             **timings,
         }
         if self.cfg.save_audio:
             audio_dir = LOG_DIR / "audio" / self.session
             audio_dir.mkdir(parents=True, exist_ok=True)
-            path = audio_dir / f"{seg.seq:05d}.wav"
-            path.write_bytes(pcm_to_wav(seg.pcm))
+            path = audio_dir / f"{utt.seq:05d}.wav"
+            path.write_bytes(pcm_to_wav(utt.pcm))
             record["audio"] = str(path.relative_to(LOG_DIR))
         day_file = LOG_DIR / f"{datetime.now():%Y-%m-%d}.jsonl"
         with day_file.open("a", encoding="utf-8") as f:
@@ -69,128 +77,203 @@ class TranscriptLogger:
 
 
 class Pipeline:
+    """mic -> local streaming ASR -> (live) throttled re-translation, (sentence end) final translation."""
+
     def __init__(self, cfg: Config, events: Events):
         self.cfg = cfg
         self.events = events
         self.device: int | None = None
+        self.lang = cfg.input_lang
         self.frames: queue.Queue = queue.Queue()
-        self.segments: queue.Queue = queue.Queue()
-        self.transcripts: queue.Queue = queue.Queue()
-        self.context: deque[tuple[str, str]] = deque(maxlen=3)
-        self.stt: STT = GroqSTT(cfg.groq_api_key, cfg.stt_model)
-        self.translator = make_translator(cfg)
+        self.finals: queue.Queue = queue.Queue()
+        self.context: deque[tuple[str, str]] = deque(maxlen=2)
+        self.quota = QuotaTracker(cfg.rpm_limits)
+        self.stt = GroqSTT(cfg.groq_api_key, cfg.stt_model, self.quota)
+        self.partial_translator = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
+        # tried in order for finished sentences; each Groq model has its own quota
+        self.final_translators: list[Translator] = [
+            OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.translate_model, self.quota),
+            self.partial_translator,
+        ]
+        if cfg.gemini_api_key:
+            self.final_translators.append(OpenAICompatTranslator(GEMINI_BASE, cfg.gemini_api_key, cfg.gemini_model))
         self.logger = TranscriptLogger(cfg)
+
+        self.recognizer: StreamingRecognizer | None = None
         self.mic: MicCapture | None = None
         self.running = threading.Event()
-        threading.Thread(target=self._segment_loop, daemon=True).start()
-        threading.Thread(target=self._stt_loop, daemon=True).start()
-        threading.Thread(target=self._translate_loop, daemon=True).start()
+        self.finalized: set[int] = set()
+        self._live = (0, "")          # latest (seq, text) for the partial translator
+        self._live_cond = threading.Condition()
+
+        for target in (self._asr_loop, self._partial_loop, self._final_loop, self._quota_loop):
+            threading.Thread(target=target, daemon=True).start()
 
     # ---- control -------------------------------------------------------
+    @property
+    def target_lang(self) -> str:
+        return self.cfg.other_lang if self.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
+
     def start(self) -> None:
         if self.running.is_set():
             return
-        self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
-        self.mic.start()
+        try:
+            if self.recognizer is None or self.recognizer.lang != self.lang:
+                self.events.on_status("음성인식 모델 불러오는 중…", "paused")
+                self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
+            self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
+            self.mic.start()
+        except Exception as e:
+            self.events.on_status(f"시작 실패: {e}", "warn")
+            return
         self.running.set()
-        self.events.on_status("듣는 중…")
+        self.events.on_status("듣는 중", "live")
 
     def stop(self) -> None:
         self.running.clear()
         if self.mic:
             self.mic.stop()
             self.mic = None
-        self.events.on_status("일시정지")
+        self.events.on_status("일시정지", "paused")
 
-    def set_device(self, device: int | None) -> None:
+    def _restart(self, apply: Callable[[], None]) -> None:
         was_running = self.running.is_set()
         self.stop()
-        self.device = device
+        apply()
         if was_running:
             self.start()
 
+    def set_device(self, device: int | None) -> None:
+        self._restart(lambda: setattr(self, "device", device))
+
+    def set_lang(self, lang: str) -> None:
+        self._restart(lambda: setattr(self, "lang", lang))
+
     # ---- workers -------------------------------------------------------
-    def _segment_loop(self) -> None:
-        cfg = self.cfg
-        seg = VadSegmenter(cfg.sample_rate, cfg.frame_ms, cfg.vad_silence_ms, cfg.max_segment_sec, cfg.vad_aggressiveness)
-        level_tick = 0
+    def _asr_loop(self) -> None:
+        seq = 1
+        last_text = ""
+        audio: list[np.ndarray] = []
+        max_frames = int((self.cfg.max_utterance_sec + 3) * 1000 / self.cfg.frame_ms)
         while True:
             frame = self.frames.get()
-            if not self.running.is_set():
+            if not self.running.is_set() or self.recognizer is None:
                 continue
-            level_tick += 1
-            if level_tick % 3 == 0:
-                self.events.on_level(min(1.0, float(abs(frame.astype("int32")).mean()) / 3000))
-            out = seg.push(frame)
-            if out is not None:
-                self.segments.put(out)
+            self.events.on_level(min(1.0, float(np.abs(frame.astype(np.int32)).mean()) / 3000))
+            audio.append(frame)
+            audio = audio[-max_frames:]
+            text, ended = self.recognizer.accept(frame)
+            if text and text != last_text:
+                last_text = text
+                self.events.on_live(seq, text)
+                with self._live_cond:
+                    self._live = (seq, text)
+                    self._live_cond.notify()
+            if ended:
+                if last_text:
+                    self.finalized.add(seq)
+                    self.finals.put(Utterance(seq, last_text, self.recognizer.lang, np.concatenate(audio), time.perf_counter()))
+                    seq += 1
+                last_text = ""
+                audio = []
 
-    def _stt_loop(self) -> None:
+    def _partial_loop(self) -> None:
+        done_seq, done_words = 0, 0
+        last_call = 0.0
         while True:
-            seg: Segment = self.segments.get()
-            prompt = " ".join(s for s, _ in self.context)
-            t0 = time.perf_counter()
-            try:
-                tr = self.stt.transcribe(seg.pcm, prompt)
-            except RateLimitError:
-                if self._switch_to_local_stt():
-                    self.segments.put(seg)  # retry this segment locally
-                else:
-                    self.events.on_status("⚠ Groq 무료 한도 초과 - 잠시 후 다시 시도됩니다")
+            with self._live_cond:
+                self._live_cond.wait(timeout=0.3)
+                seq, text = self._live
+            if not self.cfg.live_translation or not text or seq in self.finalized:
                 continue
-            except Exception as e:  # network errors must not kill the worker
-                self.events.on_status(f"⚠ 음성인식 오류: {e}")
+            words = len(text.split())
+            if seq == done_seq and words - done_words < self.cfg.partial_min_new_words:
                 continue
-            if tr is None:
+            if time.time() - last_call < self.cfg.partial_interval_sec:
                 continue
-            stt_ms = (time.perf_counter() - t0) * 1000
-            self.events.on_source(seg.seq, tr.text, tr.lang)
-            self.transcripts.put((seg, tr, {"wait_ms": round((t0 - seg.t_end) * 1000), "stt_ms": round(stt_ms)}))
-
-    def _switch_to_local_stt(self) -> bool:
-        if not self.cfg.local_stt_fallback or not isinstance(self.stt, GroqSTT):
-            return False
-        try:
-            from stt.local_stt import LocalSTT
-
-            self.events.on_status("Groq 한도 초과 → 로컬 음성인식으로 전환 중…")
-            self.stt = LocalSTT(self.cfg.local_stt_model)
-            self.events.on_status("로컬 음성인식 사용 중 (느릴 수 있음)")
-            return True
-        except Exception as e:
-            self.events.on_status(f"⚠ 로컬 음성인식 전환 실패: {e}")
-            return False
-
-    def _translate_loop(self) -> None:
-        while True:
-            seg, tr, timings = self.transcripts.get()
-            tgt = self.cfg.other_lang if tr.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
-            t0 = time.perf_counter()
-            first_token_ms = None
+            # keep 30% of the daily quota and some per-minute headroom for finished sentences
+            if not self.quota.can_use(self.partial_translator.model, min_tokens=1500, keep_day_ratio=0.3):
+                continue
+            last_call = time.time()
+            done_seq, done_words = seq, words
             out = ""
             try:
-                for piece in self.translator.stream(tr.text, tr.lang, tgt, list(self.context)):
-                    if first_token_ms is None:
-                        first_token_ms = (time.perf_counter() - t0) * 1000
+                for piece in self.partial_translator.stream(text, self.lang, self.target_lang, [], partial=True):
+                    if seq in self.finalized:
+                        break
                     out += piece
-                    self.events.on_partial(seg.seq, out)
-            except RateLimitError:
-                self.events.on_status("⚠ 번역 무료 한도 초과 - 잠시 후 다시 시도됩니다")
-                continue
-            except Exception as e:
-                self.events.on_status(f"⚠ 번역 오류: {e}")
-                continue
+                    self.events.on_partial(seq, out)
+            except Exception:
+                pass  # partials are best-effort; the final translation will follow
+
+    def _refine_source(self, utt: Utterance) -> tuple[str, int]:
+        """Polish the locally recognised sentence with Whisper when quota allows. Returns (text, ms)."""
+        if self.cfg.final_stt != "groq" or not self.quota.can_use(self.cfg.stt_model, rpm_headroom=2):
+            return utt.text, 0
+        t0 = time.perf_counter()
+        try:
+            prompt = " ".join(s for s, _ in self.context)
+            tr = self.stt.transcribe(utt.pcm, prompt, language=utt.lang)
+            if tr:
+                return tr.text, round((time.perf_counter() - t0) * 1000)
+        except Exception:
+            pass
+        return utt.text, round((time.perf_counter() - t0) * 1000)
+
+    def _final_loop(self) -> None:
+        while True:
+            utt: Utterance = self.finals.get()
+            source, stt_ms = self._refine_source(utt)
+            self.events.on_source(utt.seq, source, utt.lang)
+            tgt = self.cfg.other_lang if utt.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
+
+            t0 = time.perf_counter()
+            out, used, first_token_ms = "", None, None
+            for translator in self.final_translators:
+                if self.quota.cooldown_left(translator.model) > 0:
+                    continue
+                try:
+                    for piece in translator.stream(source, utt.lang, tgt, list(self.context)):
+                        if first_token_ms is None:
+                            first_token_ms = round((time.perf_counter() - t0) * 1000)
+                        out += piece
+                        self.events.on_partial(utt.seq, out)
+                    used = translator.model
+                    break
+                except RateLimitError:
+                    out = ""
+                    continue
+                except Exception as e:
+                    self.events.on_status(f"번역 오류: {str(e)[:80]}", "warn")
+                    out = ""
+                    continue
             out = out.strip()
-            self.events.on_final(seg.seq, out)
-            self.context.append((tr.text, out))
-            timings.update(
-                first_token_ms=round(first_token_ms or 0),
-                translate_ms=round((time.perf_counter() - t0) * 1000),
-                # speech end -> first translated word on screen
-                latency_ms=round((t0 - seg.t_end) * 1000 + (first_token_ms or 0)),
-            )
-            print(f"[{seg.seq}] {tr.lang}->{tgt} {timings}  {tr.text!r} => {out!r}", flush=True)
+            self.events.on_final(utt.seq, out)
+            if used is None:
+                self.events.on_status("번역 한도 초과 · 원문만 표시 중", "warn")
+                continue
+            if self.running.is_set():
+                self.events.on_status("듣는 중", "live")
+            self.context.append((source, out))
+            timings = {
+                "stt_ms": stt_ms,
+                "first_token_ms": first_token_ms or 0,
+                "translate_ms": round((time.perf_counter() - t0) * 1000),
+                "latency_ms": round((t0 - utt.t_end) * 1000 + (first_token_ms or 0)),
+                "model": used,
+            }
+            print(f"[{utt.seq}] {utt.lang}->{tgt} {timings}  {source!r} => {out!r}", flush=True)
             try:
-                self.logger.write(seg, tr, out, tgt, timings)
+                self.logger.write(utt, source, out, tgt, timings)
             except OSError as e:
-                self.events.on_status(f"⚠ 로그 저장 실패: {e}")
+                self.events.on_status(f"로그 저장 실패: {e}", "warn")
+
+    def _quota_loop(self) -> None:
+        labels = {
+            self.cfg.translate_model: "번역",
+            self.cfg.partial_model: "실시간",
+            self.cfg.stt_model: "인식",
+        }
+        while True:
+            time.sleep(2)
+            self.events.on_quota(self.quota.summary(labels))

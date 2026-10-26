@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,10 +15,22 @@ def _env(name: str, default: str) -> str:
 @dataclass
 class Config:
     groq_api_key: str = _env("GROQ_API_KEY", "")
+
+    # language being spoken: en (-> Korean) or ko (-> English); recognised locally, word by word
+    input_lang: str = _env("INPUT_LANG", "en")
+    # groq: polish each finished sentence with Whisper (punctuation, accuracy) while quota allows
+    # local: never call an STT API
+    final_stt: str = _env("FINAL_STT", "groq").lower()
     stt_model: str = _env("STT_MODEL", "whisper-large-v3-turbo")
 
-    translate_provider: str = _env("TRANSLATE_PROVIDER", "groq").lower()
+    # finished sentences: quality model. live (partial) re-translation: separate model = separate quota
     translate_model: str = _env("TRANSLATE_MODEL", "openai/gpt-oss-120b")
+    partial_model: str = _env("PARTIAL_MODEL", "openai/gpt-oss-20b")
+    live_translation: bool = _env("LIVE_TRANSLATION", "1") == "1"
+    partial_interval_sec: float = float(_env("PARTIAL_INTERVAL_SEC", "2.0"))
+    partial_min_new_words: int = int(_env("PARTIAL_MIN_NEW_WORDS", "4"))
+
+    # optional extra fallback when Groq is rate-limited
     gemini_api_key: str = _env("GEMINI_API_KEY", "")
     gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -26,13 +38,17 @@ class Config:
     other_lang: str = _env("OTHER_LANG", "en")
 
     sample_rate: int = 16000
-    frame_ms: int = 30
-    vad_silence_ms: int = int(_env("VAD_SILENCE_MS", "400"))
-    max_segment_sec: float = float(_env("MAX_SEGMENT_SEC", "5"))
-    vad_aggressiveness: int = int(_env("VAD_AGGRESSIVENESS", "2"))
+    frame_ms: int = 100
+    endpoint_silence_sec: float = float(_env("ENDPOINT_SILENCE_SEC", "0.6"))
+    max_utterance_sec: float = float(_env("MAX_UTTERANCE_SEC", "12"))
 
-    local_stt_fallback: bool = _env("LOCAL_STT_FALLBACK", "0") == "1"
-    local_stt_model: str = _env("LOCAL_STT_MODEL", "small")
+    # Groq free tier requests/minute (not reported in headers)
+    rpm_limits: dict = field(default_factory=lambda: {
+        "whisper-large-v3-turbo": 20,
+        "whisper-large-v3": 20,
+        "openai/gpt-oss-120b": 30,
+        "openai/gpt-oss-20b": 30,
+    })
 
     save_audio: bool = _env("SAVE_AUDIO", "0") == "1"
 
