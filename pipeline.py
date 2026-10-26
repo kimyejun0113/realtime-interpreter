@@ -116,6 +116,7 @@ class Pipeline:
 
         self.recognizer: StreamingRecognizer | None = None
         self.mic: MicCapture | SystemAudioCapture | None = None
+        self.output_name = ""  # current speaker/earphones when listening to PC sound
         self.running = threading.Event()
         self._loading = threading.Lock()
         if local_mt.available():
@@ -144,7 +145,14 @@ class Pipeline:
 
     @property
     def listening_label(self) -> str:
-        return "PC 소리 듣는 중" if self.device == SYSTEM_AUDIO else "마이크 듣는 중"
+        if self.device != SYSTEM_AUDIO:
+            return "마이크 듣는 중"
+        return f"PC 소리 듣는 중 · {self.output_name}" if self.output_name else "PC 소리 듣는 중"
+
+    def _on_output_device(self, name: str) -> None:
+        self.output_name = name
+        if self.running.is_set():
+            self.events.on_status(self.listening_label, "live")
 
     def start(self) -> None:
         """Loads the speech model off the UI thread (takes a few seconds), then opens the mic."""
@@ -159,7 +167,9 @@ class Pipeline:
                     self.events.on_status("음성인식 모델 불러오는 중…", "paused")
                     self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
                 if self.device == SYSTEM_AUDIO:
-                    self.mic = SystemAudioCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms)
+                    self.mic = SystemAudioCapture(
+                        self.frames, self.cfg.sample_rate, self.cfg.frame_ms, on_device=self._on_output_device
+                    )
                 else:
                     self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
                 self.mic.start()

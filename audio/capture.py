@@ -1,7 +1,9 @@
 import ctypes
 import queue
 import threading
+import time
 import warnings
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -62,10 +64,14 @@ class SystemAudioCapture:
     MAX_GAIN = 30.0
     SILENCE_RMS = 3e-4  # below this it's silence/hiss: don't amplify
 
-    def __init__(self, out_queue: queue.Queue, sample_rate: int, frame_ms: int):
+    DEVICE_CHECK_SEC = 1.0  # how often to look for a new default output (AirPods connected, etc.)
+
+    def __init__(self, out_queue: queue.Queue, sample_rate: int, frame_ms: int,
+                 on_device: Callable[[str], None] = lambda name: None):
         self.out_queue = out_queue
         self.sample_rate = sample_rate
         self.frame_samples = sample_rate * frame_ms // 1000
+        self.on_device = on_device  # called with the output device name whenever capture (re)starts
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
         self._level, self._gain = 0.0, 1.0
@@ -75,11 +81,27 @@ class SystemAudioCapture:
 
         ctypes.windll.ole32.CoInitializeEx(None, 0)  # WASAPI needs COM on this thread
         warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
-        speaker = sc.default_speaker()
-        loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        with loopback.recorder(samplerate=self.sample_rate, channels=1, blocksize=self.frame_samples) as rec:
-            while self._running.is_set():
-                self.out_queue.put(self.agc(rec.record(numframes=self.frame_samples)[:, 0]))
+        silence = np.zeros(self.frame_samples, np.int16)
+        checks_every = max(1, int(self.DEVICE_CHECK_SEC * self.sample_rate / self.frame_samples))
+        while self._running.is_set():
+            # follow Windows' default output: switching to earphones/AirPods reopens the loopback
+            try:
+                speaker = sc.default_speaker()
+                loopback = sc.get_microphone(id=speaker.id, include_loopback=True)
+                with loopback.recorder(samplerate=self.sample_rate, channels=1, blocksize=self.frame_samples) as rec:
+                    self.on_device(speaker.name)
+                    frames = 0
+                    while self._running.is_set():
+                        self.out_queue.put(self.agc(rec.record(numframes=self.frame_samples)[:, 0]))
+                        frames += 1
+                        if frames % checks_every == 0 and sc.default_speaker().id != speaker.id:
+                            break
+            except Exception:
+                # device unplugged / no output right now: keep the recogniser fed with silence
+                # so the current sentence still ends, then try again
+                for _ in range(5):
+                    self.out_queue.put(silence)
+                time.sleep(0.5)
 
     def agc(self, data: np.ndarray) -> np.ndarray:
         """float32 [-1, 1] frame -> int16 frame with automatic gain."""
