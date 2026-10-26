@@ -1,0 +1,8 @@
+PySide6-Essentials==6.7.3  # 6.8+ conflicts with Anaconda runtime DLLs
+sounddevice>=0.4.6
+numpy>=1.26
+webrtcvad-wheels>=2.0.11
+httpx>=0.27
+python-dotenv>=1.0
+# Optional: local STT fallback when the Groq free quota runs out
+# faster-whisper>=1.0
