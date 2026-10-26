@@ -22,6 +22,13 @@
 
 ## 실행
 
+바탕화면 바로가기 만들기 (한 번만, 이후엔 바탕화면의 "동시통역"을 더블클릭):
+```bash
+powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
+```
+바로가기로 실행하면 터미널 창 없이 뜨고, 로그는 `logs/app.log`에 남습니다.
+
+터미널에서 직접 실행 (프로젝트 폴더에서):
 ```bash
 .venv\Scripts\python main.py
 ```
