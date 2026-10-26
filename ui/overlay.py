@@ -1,10 +1,10 @@
 from collections import OrderedDict
 
-from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPropertyAnimation, QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QSettings, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-    QSizeGrip, QToolButton, QVBoxLayout, QWidget,
+    QSizeGrip, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 HISTORY = 2  # finished sentences kept above the live one
@@ -129,6 +129,10 @@ class SubtitleOverlay(QWidget):
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.RichText)
         self.body.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+        # the window decides the size; long text is trimmed to fit instead of growing past the window
+        self.body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.body.setMinimumSize(1, 1)
+        self.body.installEventFilter(self)
 
         grip_row = QHBoxLayout()
         grip_row.setContentsMargins(0, 0, 0, 0)
@@ -197,34 +201,78 @@ class SubtitleOverlay(QWidget):
                 self.entries.popitem(last=False)
         return self.entries[seq]
 
-    def _render(self) -> None:
+    def _entry_html(self, e: dict, current: bool, source: str, translation: str) -> str:
         fs = self.font_size
+        src_size = int(fs * (0.78 if current else 0.56))
+        tr_size = fs if current else int(fs * 0.68)
+        src_color = "rgba(235,235,245,0.75)" if current else "rgba(235,235,245,0.32)"
+        if not current:
+            tr_color = "rgba(255,255,255,0.5)"
+        elif e["done"]:
+            tr_color = "#FFFFFF"
+        else:
+            tr_color = "rgba(255,255,255,0.72)"  # tentative, still being re-translated
+        html = f'<p align="center" style="margin:0 0 3px 0;color:{src_color};font-size:{src_size}px">{_esc(source)}</p>'
+        if translation:
+            html += (f'<p align="center" style="margin:0 0 10px 0;color:{tr_color};font-size:{tr_size}px;'
+                     f'font-weight:{700 if current else 400}">{_esc(translation)}</p>')
+        else:
+            html += '<p style="margin:0 0 10px 0"></p>'
+        return html
+
+    def _fits(self, html: str) -> bool:
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setDefaultFont(self.body.font())
+        doc.setHtml(html)
+        doc.setTextWidth(max(100, self.body.width()))
+        return doc.size().height() <= self.body.height() - 4
+
+    def _render(self) -> None:
         if not self.entries:
             self.body.setText(
-                f'<p align="center" style="color:rgba(235,235,245,0.35);font-size:{int(fs * 0.7)}px">'
+                f'<p align="center" style="color:rgba(235,235,245,0.35);font-size:{int(self.font_size * 0.7)}px">'
                 "말을 시작하면 여기에 자막이 표시돼요</p>"
             )
             return
         items = list(self.entries.values())
-        parts = []
-        for i, e in enumerate(items):
-            current = i == len(items) - 1
-            src_size = int(fs * (0.78 if current else 0.56))
-            tr_size = fs if current else int(fs * 0.68)
-            src_color = "rgba(235,235,245,0.75)" if current else "rgba(235,235,245,0.32)"
-            if not current:
-                tr_color = "rgba(255,255,255,0.5)"
-            elif e["done"]:
-                tr_color = "#FFFFFF"
+
+        def build(entries, source=None, translation=None) -> str:
+            parts = []
+            for i, e in enumerate(entries):
+                current = i == len(entries) - 1
+                src = source if current and source is not None else e["source"]
+                tr = translation if current and translation is not None else e["translation"]
+                parts.append(self._entry_html(e, current, src, tr))
+            return "".join(parts)
+
+        # the newest text must always be visible: drop older sentences first...
+        for start in range(len(items)):
+            html = build(items[start:])
+            if self._fits(html):
+                self.body.setText(html)
+                return
+        # ...then show only the tail of a very long current sentence
+        cur = items[-1]
+        src_words, tr_words = cur["source"].split(), cur["translation"].split()
+        while True:
+            source = ("… " if len(src_words) < len(cur["source"].split()) else "") + " ".join(src_words)
+            translation = ("… " if len(tr_words) < len(cur["translation"].split()) else "") + " ".join(tr_words)
+            html = build([cur], source, translation)
+            if self._fits(html) or (len(src_words) <= 4 and len(tr_words) <= 4):
+                self.body.setText(html)
+                return
+            # trim whichever line is relatively longer, from the front (oldest words)
+            if len(src_words) > 4 and (len(src_words) >= 2 * len(tr_words) or len(tr_words) <= 4):
+                src_words = src_words[2:]
             else:
-                tr_color = "rgba(255,255,255,0.72)"  # tentative, still being re-translated
-            translation = _esc(e["translation"])
-            parts.append(
-                f'<p align="center" style="margin:0 0 3px 0;color:{src_color};font-size:{src_size}px">{_esc(e["source"])}</p>'
-                + (f'<p align="center" style="margin:0 0 10px 0;color:{tr_color};font-size:{tr_size}px;font-weight:{700 if current else 400}">'
-                   f"{translation}</p>" if translation else '<p style="margin:0 0 10px 0"></p>')
-            )
-        self.body.setText("".join(parts))
+                tr_words = tr_words[1:]
+
+    def eventFilter(self, obj, event) -> bool:
+        # re-fit when the subtitle area itself changes size (it is laid out after the window resizes)
+        if obj is self.body and event.type() == QEvent.Resize:
+            self._render()
+        return super().eventFilter(obj, event)
 
     def on_live(self, seq: int, text: str) -> None:
         e = self._entry(seq)

@@ -47,15 +47,30 @@ class Utterance:
 
 
 _SENTENCE_END = re.compile(r"[.?!](?=\s+\S)")
+_CLAUSE_END = re.compile(r"[,;:](?=\s+\S)")
+SOFT_CUT_WORDS = 12  # past this, a comma is good enough to finalise
+HARD_CUT_WORDS = 22  # past this, cut anyway (fast speech with no punctuation)
 
 
-def _last_sentence_end(text: str) -> int | None:
-    """Index just past the last sentence terminator that is followed by more words, if the head is long enough."""
+def _commit_point(text: str) -> int | None:
+    """Where to finalise the running text, if anywhere: index just past the cut.
+
+    Sentence end followed by more words -> cut there. Long run-on speech -> cut at the
+    last comma, or failing that keep only the last few words open, so a sentence never
+    grows past what the subtitle window and the translators handle quickly.
+    """
+    words = text.split()
     matches = list(_SENTENCE_END.finditer(text))
-    if not matches:
-        return None
-    end = matches[-1].end()
-    return end if len(text[:end].split()) >= 3 else None
+    if matches and len(text[: matches[-1].end()].split()) >= 3:
+        return matches[-1].end()
+    if len(words) > SOFT_CUT_WORDS:
+        clauses = [m.end() for m in _CLAUSE_END.finditer(text) if len(text[: m.end()].split()) >= 8]
+        if clauses:
+            return clauses[-1]
+    if len(words) > HARD_CUT_WORDS:
+        keep_open = 4  # the newest words may still be revised by the recogniser
+        return len(text) - len(" ".join(words[-keep_open:]))
+    return None
 
 
 class TranscriptLogger:
@@ -236,7 +251,7 @@ class Pipeline:
 
             # the model punctuates: as soon as a new sentence starts, finalise the finished one(s)
             # instead of waiting for a pause, so long run-on speech still gets quick final translations
-            boundary = None if ended else _last_sentence_end(text)
+            boundary = None if ended else _commit_point(text)
             if boundary:
                 head = text[:boundary].strip()
                 committed = full[: len(full) - len(text) + boundary]
