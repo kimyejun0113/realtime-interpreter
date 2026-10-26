@@ -23,12 +23,15 @@ class Config:
     final_stt: str = _env("FINAL_STT", "groq").lower()
     stt_model: str = _env("STT_MODEL", "whisper-large-v3-turbo")
 
-    # finished sentences: quality model. live (partial) re-translation: separate model = separate quota
+    # finished sentences: Groq quality model (second model on Groq = separate quota, used as fallback)
     translate_model: str = _env("TRANSLATE_MODEL", "openai/gpt-oss-120b")
     partial_model: str = _env("PARTIAL_MODEL", "openai/gpt-oss-20b")
+    # live (partial) re-translation while still speaking.
+    # local: NLLB on this PC, unlimited. groq: PARTIAL_MODEL, uses quota
     live_translation: bool = _env("LIVE_TRANSLATION", "1") == "1"
-    partial_interval_sec: float = float(_env("PARTIAL_INTERVAL_SEC", "2.0"))
-    partial_min_new_words: int = int(_env("PARTIAL_MIN_NEW_WORDS", "4"))
+    partial_engine: str = _env("PARTIAL_ENGINE", "local").lower()
+    partial_interval_sec: float = float(_env("PARTIAL_INTERVAL_SEC", "0.6" if partial_engine == "local" else "2.0"))
+    partial_min_new_words: int = int(_env("PARTIAL_MIN_NEW_WORDS", "1" if partial_engine == "local" else "4"))
 
     # optional extra fallback when Groq is rate-limited
     gemini_api_key: str = _env("GEMINI_API_KEY", "")
@@ -40,7 +43,7 @@ class Config:
     sample_rate: int = 16000
     frame_ms: int = 100
     endpoint_silence_sec: float = float(_env("ENDPOINT_SILENCE_SEC", "0.6"))
-    max_utterance_sec: float = float(_env("MAX_UTTERANCE_SEC", "12"))
+    max_utterance_sec: float = float(_env("MAX_UTTERANCE_SEC", "30"))
 
     # Groq free tier requests/minute (not reported in headers)
     rpm_limits: dict = field(default_factory=lambda: {

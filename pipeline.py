@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -16,6 +17,7 @@ from quota import QuotaTracker
 from stt.base import RateLimitError, pcm_to_wav
 from stt.groq_stt import GroqSTT
 from stt.streaming import StreamingRecognizer
+from translate import local_mt
 from translate.base import Translator
 from translate.openai_compat import GEMINI_BASE, GROQ_BASE, OpenAICompatTranslator
 
@@ -42,6 +44,18 @@ class Utterance:
     lang: str
     pcm: np.ndarray
     t_end: float
+
+
+_SENTENCE_END = re.compile(r"[.?!](?=\s+\S)")
+
+
+def _last_sentence_end(text: str) -> int | None:
+    """Index just past the last sentence terminator that is followed by more words, if the head is long enough."""
+    matches = list(_SENTENCE_END.finditer(text))
+    if not matches:
+        return None
+    end = matches[-1].end()
+    return end if len(text[:end].split()) >= 3 else None
 
 
 class TranscriptLogger:
@@ -89,11 +103,12 @@ class Pipeline:
         self.context: deque[tuple[str, str]] = deque(maxlen=2)
         self.quota = QuotaTracker(cfg.rpm_limits)
         self.stt = GroqSTT(cfg.groq_api_key, cfg.stt_model, self.quota)
-        self.partial_translator = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
+        groq_partial = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
+        self.partial_translator: Translator | None = None if cfg.partial_engine == "local" else groq_partial
         # tried in order for finished sentences; each Groq model has its own quota
         self.final_translators: list[Translator] = [
             OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.translate_model, self.quota),
-            self.partial_translator,
+            groq_partial,
         ]
         if cfg.gemini_api_key:
             self.final_translators.append(OpenAICompatTranslator(GEMINI_BASE, cfg.gemini_api_key, cfg.gemini_model))
@@ -102,6 +117,9 @@ class Pipeline:
         self.recognizer: StreamingRecognizer | None = None
         self.mic: MicCapture | None = None
         self.running = threading.Event()
+        self._loading = threading.Lock()
+        if local_mt.available():
+            threading.Thread(target=self._load_local_mt, daemon=True).start()
         self.finalized: set[int] = set()
         self._live = (0, "")          # latest (seq, text) for the partial translator
         self._live_cond = threading.Condition()
@@ -114,20 +132,35 @@ class Pipeline:
     def target_lang(self) -> str:
         return self.cfg.other_lang if self.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
 
-    def start(self) -> None:
-        if self.running.is_set():
-            return
+    def _load_local_mt(self) -> None:
         try:
-            if self.recognizer is None or self.recognizer.lang != self.lang:
-                self.events.on_status("음성인식 모델 불러오는 중…", "paused")
-                self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
-            self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
-            self.mic.start()
+            translator = local_mt.LocalTranslator()
         except Exception as e:
-            self.events.on_status(f"시작 실패: {e}", "warn")
+            self.events.on_status(f"로컬 번역 모델 로드 실패: {e}", "warn")
             return
-        self.running.set()
-        self.events.on_status("듣는 중", "live")
+        self.final_translators.append(translator)  # last resort when every API is rate-limited
+        if self.cfg.partial_engine == "local":
+            self.partial_translator = translator
+
+    def start(self) -> None:
+        """Loads the speech model off the UI thread (takes a few seconds), then opens the mic."""
+        if self.running.is_set() or self._loading.locked():
+            return
+        threading.Thread(target=self._start, daemon=True).start()
+
+    def _start(self) -> None:
+        with self._loading:
+            try:
+                if self.recognizer is None or self.recognizer.lang != self.lang:
+                    self.events.on_status("음성인식 모델 불러오는 중…", "paused")
+                    self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
+                self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
+                self.mic.start()
+            except Exception as e:
+                self.events.on_status(f"시작 실패: {e}", "warn")
+                return
+            self.running.set()
+            self.events.on_status("듣는 중", "live")
 
     def stop(self) -> None:
         self.running.clear()
@@ -153,8 +186,16 @@ class Pipeline:
     def _asr_loop(self) -> None:
         seq = 1
         last_text = ""
+        committed = ""  # start of the recogniser's running text already finalised sentence by sentence
         audio: list[np.ndarray] = []
         max_frames = int((self.cfg.max_utterance_sec + 3) * 1000 / self.cfg.frame_ms)
+
+        def finalize(text: str, pcm: np.ndarray) -> None:
+            nonlocal seq
+            self.finalized.add(seq)
+            self.finals.put(Utterance(seq, text, self.recognizer.lang, pcm, time.perf_counter()))
+            seq += 1
+
         while True:
             frame = self.frames.get()
             if not self.running.is_set() or self.recognizer is None:
@@ -162,7 +203,20 @@ class Pipeline:
             self.events.on_level(min(1.0, float(np.abs(frame.astype(np.int32)).mean()) / 3000))
             audio.append(frame)
             audio = audio[-max_frames:]
-            text, ended = self.recognizer.accept(frame)
+            full, ended = self.recognizer.accept(frame)
+            text = full[len(committed):].strip()
+
+            # the model punctuates: as soon as a new sentence starts, finalise the finished one(s)
+            # instead of waiting for a pause, so long run-on speech still gets quick final translations
+            boundary = None if ended else _last_sentence_end(text)
+            if boundary:
+                head = text[:boundary].strip()
+                committed = full[: len(full) - len(text) + boundary]
+                text = text[boundary:].strip()
+                self.events.on_live(seq, head)
+                finalize(head, np.zeros(0, np.int16))  # no clean audio cut mid-stream
+                last_text = ""
+
             if text and text != last_text:
                 last_text = text
                 self.events.on_live(seq, text)
@@ -171,10 +225,10 @@ class Pipeline:
                     self._live_cond.notify()
             if ended:
                 if last_text:
-                    self.finalized.add(seq)
-                    self.finals.put(Utterance(seq, last_text, self.recognizer.lang, np.concatenate(audio), time.perf_counter()))
-                    seq += 1
+                    # the audio also holds sentences already finalised; Whisper would repeat them
+                    finalize(last_text, np.zeros(0, np.int16) if committed else np.concatenate(audio))
                 last_text = ""
+                committed = ""
                 audio = []
 
     def _partial_loop(self) -> None:
@@ -191,14 +245,19 @@ class Pipeline:
                 continue
             if time.time() - last_call < self.cfg.partial_interval_sec:
                 continue
-            # keep 30% of the daily quota and some per-minute headroom for finished sentences
-            if not self.quota.can_use(self.partial_translator.model, min_tokens=1500, keep_day_ratio=0.3):
+            translator = self.partial_translator
+            if translator is None:  # local model still loading
+                continue
+            # API engine: keep 30% of the daily quota and per-minute headroom for finished sentences
+            if isinstance(translator, OpenAICompatTranslator) and not self.quota.can_use(
+                translator.model, min_tokens=1500, keep_day_ratio=0.3
+            ):
                 continue
             last_call = time.time()
             done_seq, done_words = seq, words
             out = ""
             try:
-                for piece in self.partial_translator.stream(text, self.lang, self.target_lang, [], partial=True):
+                for piece in translator.stream(text, self.lang, self.target_lang, [], partial=True):
                     if seq in self.finalized:
                         break
                     out += piece
@@ -208,7 +267,11 @@ class Pipeline:
 
     def _refine_source(self, utt: Utterance) -> tuple[str, int]:
         """Polish the locally recognised sentence with Whisper when quota allows. Returns (text, ms)."""
-        if self.cfg.final_stt != "groq" or not self.quota.can_use(self.cfg.stt_model, rpm_headroom=2):
+        if (
+            self.cfg.final_stt != "groq"
+            or len(utt.pcm) < 16000 * 0.5
+            or not self.quota.can_use(self.cfg.stt_model, rpm_headroom=2)
+        ):
             return utt.text, 0
         t0 = time.perf_counter()
         try:
@@ -252,7 +315,9 @@ class Pipeline:
             if used is None:
                 self.events.on_status("번역 한도 초과 · 원문만 표시 중", "warn")
                 continue
-            if self.running.is_set():
+            if used == local_mt.LocalTranslator.model:
+                self.events.on_status("Groq 한도 초과 · 로컬 번역 사용 중", "warn")
+            elif self.running.is_set():
                 self.events.on_status("듣는 중", "live")
             self.context.append((source, out))
             timings = {

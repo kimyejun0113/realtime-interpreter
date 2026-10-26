@@ -6,7 +6,7 @@ import sherpa_onnx
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_DIRS = {
-    "en": "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+    "en": "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06",
     "ko": "sherpa-onnx-streaming-zipformer-korean-2024-06-16",
 }
 
@@ -16,16 +16,16 @@ def model_available(lang: str) -> bool:
 
 
 def _find(model_dir: Path, part: str) -> str:
-    matches = sorted(model_dir.glob(f"{part}-*.int8.onnx")) or sorted(model_dir.glob(f"{part}-*.onnx"))
+    matches = sorted(model_dir.glob(f"{part}*.int8.onnx")) or sorted(model_dir.glob(f"{part}*.onnx"))
     if not matches:
         raise FileNotFoundError(f"{part} model not found in {model_dir}")
     return str(matches[0])
 
 
 def tidy(text: str, lang: str) -> str:
-    """The English model outputs upper-case without punctuation; make it readable."""
+    """Some models output upper-case without punctuation; make that readable."""
     text = " ".join(text.split())
-    if lang == "en" and text:
+    if lang == "en" and text and text.isupper():
         text = text.lower()
         text = " ".join("I" if w == "i" else ("I" + w[1:] if w.startswith("i'") else w) for w in text.split())
         text = text[0].upper() + text[1:]
@@ -45,7 +45,7 @@ class StreamingRecognizer:
             encoder=_find(model_dir, "encoder"),
             decoder=_find(model_dir, "decoder"),
             joiner=_find(model_dir, "joiner"),
-            num_threads=2,
+            num_threads=4,
             sample_rate=16000,
             feature_dim=80,
             decoding_method="greedy_search",

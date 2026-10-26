@@ -1,6 +1,10 @@
-PySide6-Essentials==6.7.3  # 6.8+ conflicts with Anaconda runtime DLLs
+# Use a regular (non-Anaconda) Python 3.12: Anaconda ships an old MSVC runtime
+# that crashes PySide6 6.8+, CTranslate2 and sentencepiece.
+PySide6-Essentials>=6.7
 sounddevice>=0.4.6
 numpy>=1.26
-sherpa-onnx>=1.10
+sherpa-onnx>=1.12
+ctranslate2>=4.5
+sentencepiece>=0.2
 httpx>=0.27
 python-dotenv>=1.0

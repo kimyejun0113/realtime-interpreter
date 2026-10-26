@@ -128,7 +128,7 @@ class SubtitleOverlay(QWidget):
         self.body = QLabel()
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.RichText)
-        self.body.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        self.body.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
 
         grip_row = QHBoxLayout()
         grip_row.setContentsMargins(0, 0, 0, 0)
@@ -201,17 +201,17 @@ class SubtitleOverlay(QWidget):
         fs = self.font_size
         if not self.entries:
             self.body.setText(
-                f'<div style="color:rgba(235,235,245,0.35);font-size:{int(fs * 0.7)}px">'
-                "말을 시작하면 여기에 자막이 표시돼요</div>"
+                f'<p align="center" style="color:rgba(235,235,245,0.35);font-size:{int(fs * 0.7)}px">'
+                "말을 시작하면 여기에 자막이 표시돼요</p>"
             )
             return
         items = list(self.entries.values())
         parts = []
         for i, e in enumerate(items):
             current = i == len(items) - 1
-            src_size = int(fs * (0.58 if current else 0.5))
+            src_size = int(fs * (0.78 if current else 0.56))
             tr_size = fs if current else int(fs * 0.68)
-            src_color = "rgba(235,235,245,0.6)" if current else "rgba(235,235,245,0.32)"
+            src_color = "rgba(235,235,245,0.75)" if current else "rgba(235,235,245,0.32)"
             if not current:
                 tr_color = "rgba(255,255,255,0.5)"
             elif e["done"]:
@@ -220,8 +220,8 @@ class SubtitleOverlay(QWidget):
                 tr_color = "rgba(255,255,255,0.72)"  # tentative, still being re-translated
             translation = _esc(e["translation"])
             parts.append(
-                f'<p style="margin:0 0 2px 0;color:{src_color};font-size:{src_size}px">{_esc(e["source"])}</p>'
-                + (f'<p style="margin:0 0 10px 0;color:{tr_color};font-size:{tr_size}px;font-weight:{700 if current else 400}">'
+                f'<p align="center" style="margin:0 0 3px 0;color:{src_color};font-size:{src_size}px">{_esc(e["source"])}</p>'
+                + (f'<p align="center" style="margin:0 0 10px 0;color:{tr_color};font-size:{tr_size}px;font-weight:{700 if current else 400}">'
                    f"{translation}</p>" if translation else '<p style="margin:0 0 10px 0"></p>')
             )
         self.body.setText("".join(parts))

@@ -2,26 +2,28 @@
 
 마이크로 들어오는 말을 **단어 단위로 바로 화면에 띄우고**, 말하는 도중에도 번역을 계속 다시 조합해 보여주다가, 문장이 끝나면 고품질 번역으로 확정합니다.
 - 영어 → 한국어 (기본), 한국어 → 영어 (메뉴에서 전환)
-- 무료: 음성인식은 로컬, 번역은 Groq 무료 티어
+- 무료: 음성인식과 실시간 임시 번역은 이 PC에서(한도 없음), 문장 최종 번역만 Groq 무료 티어
 
 ```
-마이크 ─▶ 로컬 스트리밍 음성인식 (sherpa-onnx, 무료·무제한) ─▶ 단어가 들리는 즉시 표시
-              │ 말하는 중 (2초마다, 새 단어 4개 이상)  ─▶ gpt-oss-20b 로 임시 번역 (흐린 글씨)
-              │ 문장 끝 (0.6초 쉼)
+마이크 ─▶ 로컬 스트리밍 음성인식 (Kroko, 문장부호까지) ─▶ 단어가 들리는 즉시 표시
+              │ 말하는 중 (0.6초마다)  ─▶ 로컬 번역 NLLB-600M 로 임시 번역 (흐린 글씨, 한도 없음)
+              │ 문장 끝 (마침표 후 다음 문장 시작, 또는 0.6초 쉼)
               ▼
-        Groq Whisper 로 문장 다듬기 (한도 여유 있을 때만) ─▶ gpt-oss-120b 최종 번역 (흰 글씨)
+        Groq gpt-oss-120b 최종 번역 (흰 글씨) ─ 한도가 차면 20b → Gemini → 로컬 번역으로 대체
 ```
 
 ## 설치
 
 1. https://console.groq.com/keys 에서 무료 API 키 발급
-2. 설치
+2. 설치 — **Anaconda가 아닌 일반 Python 3.12**가 필요합니다. Anaconda에 들어 있는 오래된 MSVC 런타임 때문에 PySide6 최신판, CTranslate2, sentencepiece가 충돌합니다. 아래처럼 `uv`로 독립 Python을 받아 쓰면 시스템은 그대로 둘 수 있어요.
    ```bash
-   python -m venv .venv
-   .venv\Scripts\python -m pip install -r requirements.txt
-   .venv\Scripts\python download_models.py en ko
+   pip install uv
+   uv python install 3.12
+   uv venv .venv --python 3.12 --python-preference only-managed
+   uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+   .venv\Scripts\python download_models.py
    ```
-   `download_models.py`는 로컬 음성인식 모델(영어 ~330MB, 한국어)을 `models/`에 받습니다.
+   `download_models.py`는 로컬 모델 약 1.1GB를 `models/`에 받습니다: 영어 음성인식(Kroko), 한국어 음성인식, 번역(NLLB-200 600M).
 3. `.env.example`을 `.env`로 복사한 뒤 `GROQ_API_KEY=` 뒤에 키 입력
 
 ## 실행
@@ -44,17 +46,14 @@ powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
 
 ## 무료 한도 관리
 
-Groq 무료 티어는 **모델마다 따로** 한도가 있습니다 (대략 번역 모델 하루 1000회·분당 30회, Whisper 하루 2000회·분당 20회).
-앱은 응답 헤더로 남은 한도를 추적해서 미리 속도를 줄입니다.
+음성인식과 실시간 임시 번역은 이 PC에서 돌아가서 **한도를 전혀 쓰지 않습니다.**
+Groq는 문장이 끝날 때 최종 번역 1회(+ 말이 멈췄을 때 Whisper로 문장 다듬기 1회)만 씁니다.
 
-- 음성인식은 로컬이라 한도를 쓰지 않음. Whisper는 문장이 끝날 때 한 번, 분당 한도에 여유가 있을 때만 사용
-- 실시간 임시 번역은 최종 번역과 **다른 모델**(20b)을 써서 한도를 나눠 씀. 하루 한도가 30% 아래로 떨어지면 자동으로 멈추고 최종 번역에 양보
-- 최종 번역은 120b → 20b → (Gemini 키가 있으면) Gemini 순으로 시도. 한도 초과(429) 시 안내된 시간만큼 해당 모델을 쉬게 함
-- 모두 막히면 영어 원문만 계속 표시
+- Groq 무료 티어는 모델마다 한도가 따로 있습니다 (대략 번역 모델 하루 1000회·분당 30회, Whisper 하루 2000회·분당 20회)
+- 앱은 응답 헤더로 남은 한도를 추적해 미리 속도를 줄이고, 자막 창 위쪽에 남은 횟수를 표시합니다
+- 최종 번역은 120b → 20b → (Gemini 키가 있으면) Gemini → 로컬 번역 순으로 시도합니다. 한도가 다 차도 번역은 계속 나옵니다
 
-더 아끼려면 `.env`에서:
-- `PARTIAL_INTERVAL_SEC` / `PARTIAL_MIN_NEW_WORDS`를 늘리기, 또는 `LIVE_TRANSLATION=0` (문장 끝에만 번역)
-- `FINAL_STT=local` (Whisper 사용 안 함)
+더 아끼려면 `.env`에서 `FINAL_STT=local`로 바꾸면 Whisper를 쓰지 않습니다.
 
 ## 통역 기록 (로그)
 
@@ -67,5 +66,5 @@ Groq 무료 티어는 **모델마다 따로** 한도가 있습니다 (대략 번
 
 ## 참고
 
-- Anaconda가 설치된 PC에서는 PySide6 6.8 이상이 DLL 충돌을 일으켜 6.7.3으로 고정했습니다.
+- 로컬 모델 라이선스: NLLB-200은 CC-BY-NC-4.0 (비상업용), Kroko는 https://huggingface.co/Banafo/Kroko-ASR 참고
 - 유튜브/줌 소리를 통역하려면 스피커 소리가 마이크로 들어가게 하거나, 설정의 마이크에서 "스테레오 믹스" 장치를 선택하세요.
