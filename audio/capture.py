@@ -121,3 +121,109 @@ class SystemAudioCapture:
         if self._thread is not None:
             self._thread.join(timeout=1)
             self._thread = None
+
+
+APP_PREFIX = "app:"  # device id "app:chrome.exe" = that app's own audio
+KNOWN_PLAYERS = {"chrome.exe", "msedge.exe", "whale.exe", "firefox.exe", "brave.exe", "opera.exe",
+                 "zoom.exe", "ms-teams.exe", "discord.exe", "vlc.exe", "potplayermini64.exe", "spotify.exe"}
+
+
+def list_audio_apps() -> list[str]:
+    """Apps worth offering for per-app capture: anything with an audio session, plus running browsers/players."""
+    import psutil
+
+    names = set()
+    try:
+        from pycaw.pycaw import AudioUtilities
+
+        for session in AudioUtilities.GetAllSessions():
+            try:
+                if session.Process:
+                    names.add(session.Process.name().lower())
+            except psutil.Error:
+                pass
+    except Exception:
+        pass
+    for p in psutil.process_iter(["name"]):
+        name = (p.info["name"] or "").lower()
+        if name in KNOWN_PLAYERS:
+            names.add(name)
+    # our own interpreter and audio/system services are never what the user wants to hear
+    skip = {"python.exe", "pythonw.exe", "svchost.exe", "audiodg.exe", "explorer.exe"}
+    return sorted(n for n in names if n not in skip and "service" not in n)
+
+
+def find_app_root(exe: str) -> int | None:
+    """PID of the top process of an app (browsers run audio in a child process; the tree covers it)."""
+    import psutil
+
+    candidates = []
+    for p in psutil.process_iter(["name", "ppid", "create_time"]):
+        if (p.info["name"] or "").lower() != exe:
+            continue
+        try:
+            parent = psutil.Process(p.info["ppid"]).name().lower()
+        except psutil.Error:
+            parent = ""
+        if parent != exe:
+            candidates.append((p.info["create_time"], p.pid))
+    return min(candidates)[1] if candidates else None
+
+
+class AppAudioCapture(SystemAudioCapture):
+    """Captures one app's own audio (Windows process loopback): works at volume 0 / muted speakers.
+
+    The app only delivers audio while it plays, so silence is padded in to keep a real-time
+    stream; otherwise pausing a video would leave the current sentence hanging.
+    """
+
+    def __init__(self, out_queue: queue.Queue, sample_rate: int, frame_ms: int, exe: str,
+                 on_device: Callable[[str], None] = lambda name: None):
+        super().__init__(out_queue, sample_rate, frame_ms, on_device)
+        self.exe = exe.lower()
+
+    def _run(self) -> None:
+        import psutil
+
+        from .app_loopback import AppLoopback
+
+        silence = np.zeros(self.frame_samples, np.int16)
+        while self._running.is_set():
+            pid = find_app_root(self.exe)
+            if pid is None:  # app not running (yet): wait for it
+                self.on_device("")
+                for _ in range(10):
+                    self.out_queue.put(silence)
+                time.sleep(1)
+                continue
+            try:
+                cap = AppLoopback(pid, self.sample_rate)
+            except Exception:
+                time.sleep(1)
+                continue
+            self.on_device(self.exe)
+            buffered = np.zeros(0, np.int16)
+            next_frame = time.perf_counter()
+            last_check = next_frame
+            frame_sec = self.frame_samples / self.sample_rate
+            try:
+                while self._running.is_set():
+                    buffered = np.concatenate([buffered, cap.read()])
+                    now = time.perf_counter()
+                    # emit one frame per frame period: real audio if we have it, silence otherwise
+                    while now >= next_frame:
+                        if len(buffered) >= self.frame_samples:
+                            frame, buffered = buffered[: self.frame_samples], buffered[self.frame_samples:]
+                        else:
+                            frame = silence
+                        self.out_queue.put(self.agc(frame.astype(np.float32) / 32768.0))
+                        next_frame += frame_sec
+                    if len(buffered) > self.sample_rate:  # never lag more than 1 s behind
+                        buffered = buffered[-self.frame_samples:]
+                    if now - last_check > 2:
+                        last_check = now
+                        if not psutil.pid_exists(pid):  # app closed/restarted: find it again
+                            break
+                    time.sleep(0.02)
+            finally:
+                cap.close()

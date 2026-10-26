@@ -11,7 +11,7 @@ from typing import Callable
 
 import numpy as np
 
-from audio.capture import SYSTEM_AUDIO, MicCapture, SystemAudioCapture
+from audio.capture import APP_PREFIX, SYSTEM_AUDIO, AppAudioCapture, MicCapture, SystemAudioCapture
 from config import Config
 from quota import QuotaTracker
 from stt.base import RateLimitError, pcm_to_wav
@@ -96,7 +96,8 @@ class Pipeline:
     def __init__(self, cfg: Config, events: Events):
         self.cfg = cfg
         self.events = events
-        self.device: int | str | None = None  # None: default mic, int: mic index, SYSTEM_AUDIO: PC sound
+        # None: default mic, int: mic index, SYSTEM_AUDIO: PC sound, "app:<exe>": one app's own audio
+        self.device: int | str | None = None
         self.lang = cfg.input_lang
         self.frames: queue.Queue = queue.Queue()
         self.finals: queue.Queue = queue.Queue()
@@ -145,14 +146,18 @@ class Pipeline:
 
     @property
     def listening_label(self) -> str:
+        if isinstance(self.device, str) and self.device.startswith(APP_PREFIX):
+            app = self.device[len(APP_PREFIX):].removesuffix(".exe")
+            return f"{app} 소리 듣는 중" if self.output_name else f"{app} 실행 대기 중"
         if self.device != SYSTEM_AUDIO:
             return "마이크 듣는 중"
         return f"PC 소리 듣는 중 · {self.output_name}" if self.output_name else "PC 소리 듣는 중"
 
     def _on_output_device(self, name: str) -> None:
+        changed = name != self.output_name
         self.output_name = name
-        if self.running.is_set():
-            self.events.on_status(self.listening_label, "live")
+        if self.running.is_set() and changed:
+            self.events.on_status(self.listening_label, "live" if name else "warn")
 
     def start(self) -> None:
         """Loads the speech model off the UI thread (takes a few seconds), then opens the mic."""
@@ -166,7 +171,12 @@ class Pipeline:
                 if self.recognizer is None or self.recognizer.lang != self.lang:
                     self.events.on_status("음성인식 모델 불러오는 중…", "paused")
                     self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
-                if self.device == SYSTEM_AUDIO:
+                if isinstance(self.device, str) and self.device.startswith(APP_PREFIX):
+                    self.mic = AppAudioCapture(
+                        self.frames, self.cfg.sample_rate, self.cfg.frame_ms,
+                        self.device[len(APP_PREFIX):], on_device=self._on_output_device,
+                    )
+                elif self.device == SYSTEM_AUDIO:
                     self.mic = SystemAudioCapture(
                         self.frames, self.cfg.sample_rate, self.cfg.frame_ms, on_device=self._on_output_device
                     )
@@ -184,6 +194,7 @@ class Pipeline:
         if self.mic:
             self.mic.stop()
             self.mic = None
+        self.output_name = ""
         self.events.on_status("일시정지", "paused")
 
     def _restart(self, apply: Callable[[], None]) -> None:

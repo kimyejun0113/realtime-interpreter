@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QMenu
 
-from audio.capture import SYSTEM_AUDIO, list_input_devices
+from audio.capture import APP_PREFIX, SYSTEM_AUDIO, list_audio_apps, list_input_devices
 from pipeline import LOG_DIR
 from stt.streaming import model_available
 
@@ -43,7 +43,8 @@ def build_menu(overlay, pipeline) -> QMenu:
     menu.addMenu(lang_menu)
 
     def use_device(device) -> None:
-        overlay.settings.setValue("input", "system" if device == SYSTEM_AUDIO else "mic")
+        # mic indices change between runs, so only PC sound / app choices are remembered
+        overlay.settings.setValue("input", device if isinstance(device, str) else "mic")
         pipeline.set_device(device)
 
     mic_menu = _menu(menu, "듣기")
@@ -52,6 +53,24 @@ def build_menu(overlay, pipeline) -> QMenu:
     system.triggered.connect(lambda: use_device(SYSTEM_AUDIO))
     mic_group.addAction(system)
     mic_menu.addAction(system)
+
+    # per-app capture works even with the PC volume at 0 / speakers muted
+    app_menu = _menu(mic_menu, "앱 소리만 (무음이어도 됨)")
+    apps = list_audio_apps()
+    current = pipeline.device if isinstance(pipeline.device, str) and pipeline.device.startswith(APP_PREFIX) else None
+    if current and current[len(APP_PREFIX):] not in apps:
+        apps.insert(0, current[len(APP_PREFIX):])
+    for exe in apps:
+        act = QAction(exe.removesuffix(".exe"), app_menu, checkable=True, checked=current == APP_PREFIX + exe)
+        act.triggered.connect(lambda _=False, e=exe: use_device(APP_PREFIX + e))
+        mic_group.addAction(act)
+        app_menu.addAction(act)
+    if not apps:
+        app_menu.addAction("소리를 내는 앱이 없어요").setEnabled(False)
+    mic_menu.addMenu(app_menu)
+    if current:
+        app_menu.menuAction().setCheckable(True)
+        app_menu.menuAction().setChecked(True)
     mic_menu.addSeparator()
     default = QAction("마이크 (시스템 기본)", mic_menu, checkable=True, checked=pipeline.device is None)
     default.triggered.connect(lambda: use_device(None))
