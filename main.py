@@ -1,4 +1,11 @@
 import sys
+from pathlib import Path
+
+# Launched via pythonw (desktop shortcut) there is no console: keep output in logs/app.log
+if sys.stdout is None or sys.stderr is None:
+    log_dir = Path(__file__).with_name("logs")
+    log_dir.mkdir(exist_ok=True)
+    sys.stdout = sys.stderr = open(log_dir / "app.log", "a", encoding="utf-8", buffering=1)
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
