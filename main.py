@@ -30,7 +30,7 @@ def main() -> int:
     overlay = SubtitleOverlay()
     bridge = Bridge()
     events = Events()
-    for name in ("live", "partial", "source", "final", "level", "quota"):
+    for name in ("live", "partial", "source", "final", "merged", "level", "quota"):
         signal = getattr(bridge, name)
         setattr(events, f"on_{name}", signal.emit)
         if hasattr(overlay, f"on_{name}"):

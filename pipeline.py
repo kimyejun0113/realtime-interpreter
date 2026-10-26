@@ -19,7 +19,7 @@ from stt.groq_stt import GroqSTT
 from stt.streaming import StreamingRecognizer
 from translate import local_mt
 from translate.base import Translator
-from translate.openai_compat import GEMINI_BASE, GROQ_BASE, OpenAICompatTranslator
+from translate.openai_compat import GEMINI_BASE, GROQ_BASE, OPENAI_BASE, OpenAICompatTranslator
 
 LOG_DIR = Path(__file__).with_name("logs")
 
@@ -32,6 +32,7 @@ class Events:
         self.on_partial: Callable[[int, str], None] = lambda seq, text: None          # tentative translation
         self.on_source: Callable[[int, str, str], None] = lambda seq, text, lang: None  # final source text
         self.on_final: Callable[[int, str], None] = lambda seq, text: None            # final translation
+        self.on_merged: Callable[[int], None] = lambda seq: None                      # seq folded into the next
         self.on_status: Callable[[str, str], None] = lambda msg, kind: None           # kind: live/paused/warn
         self.on_level: Callable[[float], None] = lambda level: None
         self.on_quota: Callable[[str], None] = lambda text: None
@@ -47,9 +48,14 @@ class Utterance:
 
 
 _SENTENCE_END = re.compile(r"[.?!](?=\s+\S)")
+_SENTENCE_FINAL = re.compile(r"[.?!][\"')\]]*\s*$")
 _CLAUSE_END = re.compile(r"[,;:](?=\s+\S)")
-SOFT_CUT_WORDS = 12  # past this, a comma is good enough to finalise
-HARD_CUT_WORDS = 22  # past this, cut anyway (fast speech with no punctuation)
+# Korean puts the verb last, so translating half an English sentence reads badly: prefer whole
+# sentences (the local live translation covers the wait) and only split genuinely long run-ons.
+SOFT_CUT_WORDS = 25  # past this, a comma is good enough to finalise
+HARD_CUT_WORDS = 40  # past this, cut anyway (fast speech with no punctuation)
+SHORT_FRAGMENT_WORDS = 6  # an unfinished piece shorter than this is joined to the next one
+MERGE_WAIT_SEC = 3.0      # ...if the next one arrives within this time
 
 
 def _commit_point(text: str) -> int | None:
@@ -116,16 +122,18 @@ class Pipeline:
         self.lang = cfg.input_lang
         self.frames: queue.Queue = queue.Queue()
         self.finals: queue.Queue = queue.Queue()
-        self.context: deque[tuple[str, str]] = deque(maxlen=2)
+        self.context: deque[tuple[str, str]] = deque(maxlen=3)
         self.quota = QuotaTracker(cfg.rpm_limits)
         self.stt = GroqSTT(cfg.groq_api_key, cfg.stt_model, self.quota)
         groq_partial = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
         self.partial_translator: Translator | None = None if cfg.partial_engine == "local" else groq_partial
         # tried in order for finished sentences; each Groq model has its own quota
         self.final_translators: list[Translator] = [
-            OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.translate_model, self.quota),
-            groq_partial,
+            OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, model, self.quota)
+            for model in dict.fromkeys([cfg.translate_model, *cfg.fallback_models])
         ]
+        if cfg.openai_api_key:
+            self.final_translators.insert(0, OpenAICompatTranslator(OPENAI_BASE, cfg.openai_api_key, cfg.openai_model))
         if cfg.gemini_api_key:
             self.final_translators.append(OpenAICompatTranslator(GEMINI_BASE, cfg.gemini_api_key, cfg.gemini_model))
         self.logger = TranscriptLogger(cfg)
@@ -326,9 +334,22 @@ class Pipeline:
             pass
         return utt.text, round((time.perf_counter() - t0) * 1000)
 
+    def _next_final(self) -> Utterance:
+        """Next utterance to translate, with short unfinished pieces ("which I") joined to what follows."""
+        utt: Utterance = self.finals.get()
+        while len(utt.text.split()) < SHORT_FRAGMENT_WORDS and not _SENTENCE_FINAL.search(utt.text):
+            try:
+                nxt: Utterance = self.finals.get(timeout=MERGE_WAIT_SEC)
+            except queue.Empty:
+                break  # speaker stopped: translate the piece on its own
+            self.events.on_merged(utt.seq)
+            pcm = np.concatenate([utt.pcm, nxt.pcm]) if len(utt.pcm) and len(nxt.pcm) else np.zeros(0, np.int16)
+            utt = Utterance(nxt.seq, f"{utt.text} {nxt.text}", nxt.lang, pcm, nxt.t_end)
+        return utt
+
     def _final_loop(self) -> None:
         while True:
-            utt: Utterance = self.finals.get()
+            utt = self._next_final()
             source, stt_ms = self._refine_source(utt)
             self.events.on_source(utt.seq, source, utt.lang)
             tgt = self.cfg.other_lang if utt.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
@@ -379,7 +400,7 @@ class Pipeline:
     def _quota_loop(self) -> None:
         labels = {
             self.cfg.translate_model: "번역",
-            self.cfg.partial_model: "실시간",
+            **{m: "예비" + str(i + 1) for i, m in enumerate(self.cfg.fallback_models)},
             self.cfg.stt_model: "인식",
         }
         while True:

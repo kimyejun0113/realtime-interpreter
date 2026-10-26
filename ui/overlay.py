@@ -36,6 +36,7 @@ class Bridge(QObject):
     partial = Signal(int, str)
     source = Signal(int, str, str)
     final = Signal(int, str)
+    merged = Signal(int)
     status = Signal(str, str)
     level = Signal(float)
     quota = Signal(str)
@@ -311,6 +312,11 @@ class SubtitleOverlay(QWidget):
             e["final_at"] = time.monotonic()
             if text:
                 e["translation"] = text
+            self._render()
+
+    def on_merged(self, seq: int) -> None:
+        # this piece is being translated together with the next one, which shows the combined text
+        if self.entries.pop(seq, None) is not None:
             self._render()
 
     def on_quota(self, text: str) -> None:

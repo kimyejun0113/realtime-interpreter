@@ -10,6 +10,7 @@ from .base import Translator, build_messages
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+OPENAI_BASE = "https://api.openai.com/v1"
 
 
 class OpenAICompatTranslator(Translator):
