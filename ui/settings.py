@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QMenu
 
-from audio.capture import list_input_devices
+from audio.capture import SYSTEM_AUDIO, list_input_devices
 from pipeline import LOG_DIR
 from stt.streaming import model_available
 
@@ -42,10 +42,19 @@ def build_menu(overlay, pipeline) -> QMenu:
         lang_menu.addAction(act)
     menu.addMenu(lang_menu)
 
-    mic_menu = _menu(menu, "마이크")
+    def use_device(device) -> None:
+        overlay.settings.setValue("input", "system" if device == SYSTEM_AUDIO else "mic")
+        pipeline.set_device(device)
+
+    mic_menu = _menu(menu, "듣기")
     mic_group = QActionGroup(mic_menu)
-    default = QAction("시스템 기본", mic_menu, checkable=True, checked=pipeline.device is None)
-    default.triggered.connect(lambda: pipeline.set_device(None))
+    system = QAction("PC 소리 (영상·회의)", mic_menu, checkable=True, checked=pipeline.device == SYSTEM_AUDIO)
+    system.triggered.connect(lambda: use_device(SYSTEM_AUDIO))
+    mic_group.addAction(system)
+    mic_menu.addAction(system)
+    mic_menu.addSeparator()
+    default = QAction("마이크 (시스템 기본)", mic_menu, checkable=True, checked=pipeline.device is None)
+    default.triggered.connect(lambda: use_device(None))
     mic_group.addAction(default)
     mic_menu.addAction(default)
     seen = set()
@@ -54,7 +63,7 @@ def build_menu(overlay, pipeline) -> QMenu:
             continue
         seen.add(name)
         act = QAction(name, mic_menu, checkable=True, checked=pipeline.device == idx)
-        act.triggered.connect(lambda _=False, i=idx: pipeline.set_device(i))
+        act.triggered.connect(lambda _=False, i=idx: use_device(i))
         mic_group.addAction(act)
         mic_menu.addAction(act)
     menu.addMenu(mic_menu)

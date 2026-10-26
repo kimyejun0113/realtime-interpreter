@@ -11,7 +11,7 @@ from typing import Callable
 
 import numpy as np
 
-from audio.capture import MicCapture
+from audio.capture import SYSTEM_AUDIO, MicCapture, SystemAudioCapture
 from config import Config
 from quota import QuotaTracker
 from stt.base import RateLimitError, pcm_to_wav
@@ -96,7 +96,7 @@ class Pipeline:
     def __init__(self, cfg: Config, events: Events):
         self.cfg = cfg
         self.events = events
-        self.device: int | None = None
+        self.device: int | str | None = None  # None: default mic, int: mic index, SYSTEM_AUDIO: PC sound
         self.lang = cfg.input_lang
         self.frames: queue.Queue = queue.Queue()
         self.finals: queue.Queue = queue.Queue()
@@ -115,7 +115,7 @@ class Pipeline:
         self.logger = TranscriptLogger(cfg)
 
         self.recognizer: StreamingRecognizer | None = None
-        self.mic: MicCapture | None = None
+        self.mic: MicCapture | SystemAudioCapture | None = None
         self.running = threading.Event()
         self._loading = threading.Lock()
         if local_mt.available():
@@ -142,6 +142,10 @@ class Pipeline:
         if self.cfg.partial_engine == "local":
             self.partial_translator = translator
 
+    @property
+    def listening_label(self) -> str:
+        return "PC 소리 듣는 중" if self.device == SYSTEM_AUDIO else "마이크 듣는 중"
+
     def start(self) -> None:
         """Loads the speech model off the UI thread (takes a few seconds), then opens the mic."""
         if self.running.is_set() or self._loading.locked():
@@ -154,13 +158,16 @@ class Pipeline:
                 if self.recognizer is None or self.recognizer.lang != self.lang:
                     self.events.on_status("음성인식 모델 불러오는 중…", "paused")
                     self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
-                self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
+                if self.device == SYSTEM_AUDIO:
+                    self.mic = SystemAudioCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms)
+                else:
+                    self.mic = MicCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device)
                 self.mic.start()
             except Exception as e:
                 self.events.on_status(f"시작 실패: {e}", "warn")
                 return
             self.running.set()
-            self.events.on_status("듣는 중", "live")
+            self.events.on_status(self.listening_label, "live")
 
     def stop(self) -> None:
         self.running.clear()
@@ -176,7 +183,7 @@ class Pipeline:
         if was_running:
             self.start()
 
-    def set_device(self, device: int | None) -> None:
+    def set_device(self, device: int | str | None) -> None:
         self._restart(lambda: setattr(self, "device", device))
 
     def set_lang(self, lang: str) -> None:
@@ -318,7 +325,7 @@ class Pipeline:
             if used == local_mt.LocalTranslator.model:
                 self.events.on_status("Groq 한도 초과 · 로컬 번역 사용 중", "warn")
             elif self.running.is_set():
-                self.events.on_status("듣는 중", "live")
+                self.events.on_status(self.listening_label, "live")
             self.context.append((source, out))
             timings = {
                 "stt_ms": stt_ms,

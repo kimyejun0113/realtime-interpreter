@@ -9,6 +9,7 @@ if sys.stdout is None or sys.stderr is None:
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from audio.capture import SYSTEM_AUDIO
 from config import Config
 from pipeline import Events, Pipeline
 from ui.overlay import Bridge, SubtitleOverlay
@@ -36,6 +37,8 @@ def main() -> int:
             signal.connect(getattr(overlay, f"on_{name}"))
 
     pipeline = Pipeline(cfg, events)
+    if overlay.settings.value("input") == "system":  # remember PC sound vs mic between runs
+        pipeline.device = SYSTEM_AUDIO
 
     def on_status(msg: str, kind: str) -> None:
         overlay.set_status(msg, kind)
