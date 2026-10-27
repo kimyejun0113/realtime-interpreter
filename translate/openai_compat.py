@@ -32,7 +32,7 @@ class OpenAICompatTranslator(Translator):
         payload = {
             "model": self.model,
             "messages": build_messages(text, src, tgt, context, partial),
-            "temperature": 0.2,
+            "temperature": 0.1,
             "max_tokens": 300 if partial else 500,
             "stream": True,
         }

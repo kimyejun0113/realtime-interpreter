@@ -24,9 +24,10 @@ class Config:
     stt_model: str = _env("STT_MODEL", "whisper-large-v3-turbo")
 
     # finished sentences: engines tried in order, skipping any without an API key (see translate/engines.py).
-    # Qwen first: natural Korean, ~0.4 s, no reasoning tokens -> the daily token quota lasts longer
+    # gpt-oss-120b first: most accurate (Qwen sometimes turns Thursday into 수요일); Qwen takes over when
+    # 120b's 200k tokens/day run out
     translate_engines: str = _env(
-        "TRANSLATE_ENGINES", "groq:qwen/qwen3.8-27b, groq:openai/gpt-oss-120b, groq:openai/gpt-oss-20b"
+        "TRANSLATE_ENGINES", "groq:openai/gpt-oss-120b, groq:qwen/qwen3.8-27b, groq:openai/gpt-oss-20b"
     )
     partial_model: str = _env("PARTIAL_MODEL", "openai/gpt-oss-20b")
     # live (partial) re-translation while still speaking.
