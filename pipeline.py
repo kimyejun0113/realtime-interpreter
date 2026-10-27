@@ -1,30 +1,36 @@
 import json
 import queue
+from concurrent.futures import ThreadPoolExecutor
 import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-from audio.capture import APP_PREFIX, SYSTEM_AUDIO, AppAudioCapture, MicCapture, SystemAudioCapture
+from audio.capture import (
+    APP_PREFIX, FILE_PREFIX, SYSTEM_AUDIO, AppAudioCapture, FileCapture, MicCapture, SystemAudioCapture,
+)
 from config import Config
 from quota import QuotaTracker
 from stt.base import RateLimitError, pcm_to_wav
 from stt.groq_stt import GroqSTT
-from stt.streaming import StreamingRecognizer
+from stt.streaming import DualRecognizer, StreamingRecognizer
 from translate import local_mt
 from translate.base import Translator
-from translate import engines
+from translate import engines, spacing
 from translate.base import Context
 from translate.memo import MemoKeeper
 from translate.openai_compat import GROQ_BASE, OpenAICompatTranslator
 
 LOG_DIR = Path(__file__).with_name("logs")
+AUTO = "auto"            # input language mode: detect English/Korean per sentence
+AUTO_LANGS = ("en", "ko")
 
 
 class Events:
@@ -39,6 +45,7 @@ class Events:
         self.on_status: Callable[[str, str], None] = lambda msg, kind: None           # kind: live/paused/warn
         self.on_level: Callable[[float], None] = lambda level: None
         self.on_quota: Callable[[str], None] = lambda text: None
+        self.on_lang: Callable[[str], None] = lambda lang: None                       # language now heard
 
 
 @dataclass
@@ -80,6 +87,22 @@ def _commit_point(text: str) -> int | None:
         keep_open = 4  # the newest words may still be revised by the recogniser
         return len(text) - len(" ".join(words[-keep_open:]))
     return None
+
+
+def _written_in(text: str, lang: str) -> bool:
+    """Whether the script matches the language: mostly Hangul for Korean, almost none otherwise."""
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return False
+    hangul = sum("가" <= ch <= "힣" for ch in letters) / len(letters)
+    return hangul >= 0.5 if lang == "ko" else hangul <= 0.1
+
+
+def _similar(a: str, b: str, threshold: float = 0.5) -> bool:
+    """Same sentence, give or take spelling and punctuation (compared letter by letter, ignoring spaces)."""
+    def norm(s: str) -> str:
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+    return SequenceMatcher(None, norm(a), norm(b)).ratio() >= threshold
 
 
 class TranscriptLogger:
@@ -138,7 +161,8 @@ class Pipeline:
         self.memo = MemoKeeper(memo_models, self.quota, on_update=lambda m: print(f"[memo]\n{m}", flush=True))
         self.logger = TranscriptLogger(cfg)
 
-        self.recognizer: StreamingRecognizer | None = None
+        self.recognizer: StreamingRecognizer | DualRecognizer | None = None
+        self._recognizer_mode = ""  # the self.lang the recognizer was built for
         self.mic: MicCapture | SystemAudioCapture | None = None
         self.output_name = ""  # current speaker/earphones when listening to PC sound
         self.running = threading.Event()
@@ -155,7 +179,28 @@ class Pipeline:
     # ---- control -------------------------------------------------------
     @property
     def target_lang(self) -> str:
-        return self.cfg.other_lang if self.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
+        return self.target_for(self.current_lang)
+
+    @property
+    def current_lang(self) -> str:
+        """Language being heard right now ("auto" mode follows the recogniser's pick)."""
+        if self.recognizer is not None:
+            return self.recognizer.last_lang
+        return self.cfg.other_lang if self.lang == AUTO else self.lang
+
+    def target_for(self, lang: str) -> str:
+        return self.cfg.other_lang if lang == self.cfg.main_target_lang else self.cfg.main_target_lang
+
+    def _build_recognizer(self) -> StreamingRecognizer | DualRecognizer:
+        silence, max_sec = self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec
+        if self.lang != AUTO:
+            return StreamingRecognizer(self.lang, silence, max_sec)
+        # both models side by side (2 threads each); load them in parallel to halve the wait
+        with ThreadPoolExecutor(2) as pool:
+            models = dict(zip(AUTO_LANGS, pool.map(
+                lambda lang: StreamingRecognizer(lang, silence, max_sec, threads=2), AUTO_LANGS)))
+        previous = self.recognizer.last_lang if self.recognizer is not None else self.cfg.other_lang
+        return DualRecognizer(models, initial=previous)
 
     def _load_local_mt(self) -> None:
         try:
@@ -191,10 +236,13 @@ class Pipeline:
     def _start(self) -> None:
         with self._loading:
             try:
-                if self.recognizer is None or self.recognizer.lang != self.lang:
+                if self.recognizer is None or self._recognizer_mode != self.lang:
                     self.events.on_status("음성인식 모델 불러오는 중…", "paused")
-                    self.recognizer = StreamingRecognizer(self.lang, self.cfg.endpoint_silence_sec, self.cfg.max_utterance_sec)
-                if isinstance(self.device, str) and self.device.startswith(APP_PREFIX):
+                    self.recognizer = self._build_recognizer()
+                    self._recognizer_mode = self.lang
+                if isinstance(self.device, str) and self.device.startswith(FILE_PREFIX):
+                    self.mic = FileCapture(self.frames, self.cfg.sample_rate, self.cfg.frame_ms, self.device[len(FILE_PREFIX):])
+                elif isinstance(self.device, str) and self.device.startswith(APP_PREFIX):
                     self.mic = AppAudioCapture(
                         self.frames, self.cfg.sample_rate, self.cfg.frame_ms,
                         self.device[len(APP_PREFIX):], on_device=self._on_output_device,
@@ -256,13 +304,14 @@ class Pipeline:
         seq = 1
         last_text = ""
         committed = ""  # start of the recogniser's running text already finalised sentence by sentence
+        heard_lang = ""
         audio: list[np.ndarray] = []
         max_frames = int((self.cfg.max_utterance_sec + 3) * 1000 / self.cfg.frame_ms)
 
         def finalize(text: str, pcm: np.ndarray) -> None:
             nonlocal seq
             self.finalized.add(seq)
-            self.finals.put(Utterance(seq, text, self.recognizer.lang, pcm, time.perf_counter()))
+            self.finals.put(Utterance(seq, text, self.recognizer.last_lang, pcm, time.perf_counter()))
             seq += 1
 
         while True:
@@ -273,6 +322,9 @@ class Pipeline:
             audio.append(frame)
             audio = audio[-max_frames:]
             full, ended = self.recognizer.accept(frame)
+            if self.recognizer.last_lang != heard_lang:
+                heard_lang = self.recognizer.last_lang
+                self.events.on_lang(heard_lang)
             text = full[len(committed):].strip()
 
             # the model punctuates: as soon as a new sentence starts, finalise the finished one(s)
@@ -326,7 +378,8 @@ class Pipeline:
             done_seq, done_words = seq, words
             out = ""
             try:
-                for piece in translator.stream(text, self.lang, self.target_lang, Context(), partial=True):
+                lang = self.current_lang
+                for piece in translator.stream(text, lang, self.target_for(lang), Context(), partial=True):
                     if seq in self.finalized:
                         break
                     out += piece
@@ -344,9 +397,11 @@ class Pipeline:
             return utt.text, 0
         t0 = time.perf_counter()
         try:
-            prompt = " ".join(s for s, _ in self.history)
+            # earlier sentences in another language push Whisper into translating instead of transcribing
+            prompt = " ".join(s for s, _ in self.history if _written_in(s, utt.lang))
             tr = self.stt.transcribe(utt.pcm, prompt, language=utt.lang)
-            if tr:
+            # Whisper polishes; it must not rewrite (it can echo its prompt or translate instead)
+            if tr and _written_in(tr.text, utt.lang) and _similar(tr.text, utt.text):
                 return tr.text, round((time.perf_counter() - t0) * 1000)
         except Exception:
             pass
@@ -365,12 +420,20 @@ class Pipeline:
             utt = Utterance(nxt.seq, f"{utt.text} {nxt.text}", nxt.lang, pcm, nxt.t_end)
         return utt
 
+    def _fix_spacing(self, seq: int, source: str) -> None:
+        spaced = spacing.space_korean(source, self.memo.models, self.quota)
+        if spaced:
+            self.events.on_source(seq, spaced, "ko")
+
     def _final_loop(self) -> None:
         while True:
             utt = self._next_final()
             source, stt_ms = self._refine_source(utt)
             self.events.on_source(utt.seq, source, utt.lang)
-            tgt = self.cfg.other_lang if utt.lang == self.cfg.main_target_lang else self.cfg.main_target_lang
+            if utt.lang == "ko" and spacing.needs_spacing(source):
+                # display only: translate right away, put the spaced text on screen when it arrives
+                threading.Thread(target=self._fix_spacing, args=(utt.seq, source), daemon=True).start()
+            tgt = self.target_for(utt.lang)
 
             t0 = time.perf_counter()
             out, used, first_token_ms = "", None, None

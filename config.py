@@ -16,8 +16,8 @@ def _env(name: str, default: str) -> str:
 class Config:
     groq_api_key: str = _env("GROQ_API_KEY", "")
 
-    # language being spoken: en (-> Korean) or ko (-> English); recognised locally, word by word
-    input_lang: str = _env("INPUT_LANG", "en")
+    # language being spoken: auto (detect English/Korean per sentence), en (-> Korean) or ko (-> English)
+    input_lang: str = _env("INPUT_LANG", "auto")
     # groq: polish each finished sentence with Whisper (punctuation, accuracy) while quota allows
     # local: never call an STT API
     final_stt: str = _env("FINAL_STT", "groq").lower()

@@ -51,6 +51,49 @@ class MicCapture:
 
 
 SYSTEM_AUDIO = "system"  # device id for "what the PC is playing" (WASAPI loopback)
+FILE_PREFIX = "file:"    # device id "file:<path.wav>" = play a recording in real time (smoke tests)
+
+
+class FileCapture:
+    """Feeds a 16 kHz mono WAV at real-time pace, then silence, as if it came from a microphone."""
+
+    def __init__(self, out_queue: queue.Queue, sample_rate: int, frame_ms: int, path: str):
+        import wave
+
+        with wave.open(path) as w:
+            if w.getframerate() != sample_rate or w.getnchannels() != 1 or w.getsampwidth() != 2:
+                raise ValueError(f"{path}: need {sample_rate} Hz mono 16-bit WAV")
+            self.pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+        self.out_queue = out_queue
+        self.frame_samples = sample_rate * frame_ms // 1000
+        self.frame_sec = frame_ms / 1000
+        self._running = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def duration(self) -> float:
+        return len(self.pcm) * self.frame_sec / self.frame_samples
+
+    def _run(self) -> None:
+        silence = np.zeros(self.frame_samples, np.int16)
+        pos, next_frame = 0, time.perf_counter()
+        while self._running.is_set():
+            frame = self.pcm[pos: pos + self.frame_samples]
+            pos += self.frame_samples
+            self.out_queue.put(frame if len(frame) == self.frame_samples else silence)
+            next_frame += self.frame_sec
+            time.sleep(max(0.0, next_frame - time.perf_counter()))
+
+    def start(self) -> None:
+        self._running.set()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running.clear()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+            self._thread = None
 
 
 class SystemAudioCapture:

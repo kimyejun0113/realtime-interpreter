@@ -34,10 +34,16 @@ def build_menu(overlay, pipeline) -> QMenu:
 
     lang_menu = _menu(menu, "언어")
     lang_group = QActionGroup(lang_menu)
-    for code, label in (("en", "영어 → 한국어"), ("ko", "한국어 → 영어")):
+
+    def use_lang(code: str) -> None:
+        overlay.settings.setValue("lang", code)
+        pipeline.set_lang(code)
+
+    for code, label, needs in (("auto", "자동 (영어↔한국어)", ("en", "ko")), ("en", "영어 → 한국어", ("en",)),
+                               ("ko", "한국어 → 영어", ("ko",))):
         act = QAction(label, lang_menu, checkable=True, checked=pipeline.lang == code)
-        act.setEnabled(model_available(code))
-        act.triggered.connect(lambda _=False, c=code: pipeline.set_lang(c))
+        act.setEnabled(all(model_available(m) for m in needs))
+        act.triggered.connect(lambda _=False, c=code: use_lang(c))
         lang_group.addAction(act)
         lang_menu.addAction(act)
     menu.addMenu(lang_menu)

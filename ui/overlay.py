@@ -40,6 +40,7 @@ class Bridge(QObject):
     status = Signal(str, str)
     level = Signal(float)
     quota = Signal(str)
+    lang = Signal(str)
 
 
 class IconButton(QToolButton):
@@ -186,8 +187,8 @@ class SubtitleOverlay(QWidget):
         self.settings.setValue("bg_alpha", alpha)
         self._apply_style()
 
-    def set_lang_label(self, src: str, tgt: str) -> None:
-        self.lang_label.setText(f"{src.upper()} → {tgt.upper()}")
+    def set_lang_label(self, src: str, tgt: str, auto: bool = False) -> None:
+        self.lang_label.setText(("자동 · " if auto else "") + f"{src.upper()} → {tgt.upper()}")
 
     def set_running(self, running: bool) -> None:
         self.toggle_btn.setText(ICON_PAUSE if running else ICON_PLAY)
