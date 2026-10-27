@@ -20,6 +20,8 @@
 ## 해 봤는데 안 된 것 (다시 시도하기 전에 읽기)
 - **인식기 핫워드(용어 힌트, 2026-10-27):** sherpa-onnx `modified_beam_search` + `hotwords_file`/`create_stream(hotwords)`. Kroko 배포판에는 `bpe.model`이 없어서 `tokens.txt`로 `bpe_vocab`을 흉내 냈다. 점수 0이면 효과가 전혀 없었고(score 6까지), 길이 가중 점수를 주면 문장 가운데가 통째로 사라지는 등 오히려 망가졌다. RTF는 0.09에서 0.12로 문제없었다. 다시 하려면 원본 BPE 모델이 있는 영어 모델로 바꿔야 한다. 지금은 이름·용어 통일을 번역 쪽 대화 메모 용어집과 Whisper 다듬기로 대신한다.
 
+- **Whisper 프롬프트에 대화 메모의 이름·용어 힌트(2026-10-27):** 메모는 인식 결과로 만들어져서 틀린 철자("Elyna Park", "Grok")가 들어가고, 힌트가 그 오류를 굳혔다. 15문장 이름 위주 강연에서 Elena Park 정답률이 힌트 없음 3/3에서 힌트 있음 3/7로 떨어졌고, Groq·Kubernetes·Raghunathan은 둘 다 못 맞혔다. 효과를 보려면 사용자가 **올바른 철자를 직접 적은 용어집**을 힌트로 줘야 한다.
+
 ## 커밋 전
 ```
 .venv\Scripts\python -m pytest -q
