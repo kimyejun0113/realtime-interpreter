@@ -36,29 +36,25 @@ def build_messages(text: str, src: str, tgt: str, context: Context, partial: boo
 
     # Tuned on real lecture/video logs: subtitle-style rewording, no filler words, no added
     # content, one consistent register, and graceful handling of half-finished sentences.
+    # every final request pays for this text, so it is kept terse (same rules, ~half the tokens)
     system = (
-        f"You translate live {lang_name(src)} speech into {lang_name(tgt)} subtitles for someone watching a video.\n"
-        f"- Write natural spoken {lang_name(tgt)} the way a professional subtitle translator would, "
-        f"not word-for-word. Reorder freely so it reads like {lang_name(tgt)}.\n"
-        "- Drop verbal fillers and hedges that add nothing (you know, like, I mean, kind of, sort of, "
-        "um, okay so, basically, actually) unless they carry meaning.\n"
-        "- Never add information, explanations or answers that are not in the source. "
-        "If the speaker asks a question, translate the question.\n"
-        "- The input comes from speech recognition: it may lack punctuation, stop mid-sentence or "
-        "contain misheard words. Use the context to infer the intended words.\n"
-        "- If the input is an unfinished sentence, translate it as a natural unfinished phrase ending "
-        'with "…" instead of inventing an ending.\n'
-        "- Keep names, numbers, dates, days of the week and technical terms exactly as said.\n"
-        "- Output only the subtitle text."
+        f"Translate live {lang_name(src)} speech into {lang_name(tgt)} video subtitles.\n"
+        "- Natural, like a professional subtitler; reorder freely, not word-for-word.\n"
+        "- Drop empty fillers (you know, like, I mean, kind of, um, basically, actually).\n"
+        "- Add nothing that wasn't said; translate questions as questions.\n"
+        "- Input is speech recognition: punctuation may be missing, words misheard; infer from context.\n"
+        "- Input often stops mid-sentence. Then translate it as a natural unfinished phrase ending "
+        'with "…"; never invent an ending.\n'
+        "- Keep names, numbers, dates, weekdays and technical terms exactly.\n"
+        "- Output only the subtitle."
     )
     style = KO_STYLES.get(KO_STYLE, KO_STYLES["합니다"])
     if tgt == "ko":
         system += "\n- " + style["rule"]
     if context.memo:
-        system += ("\n\nConversation notes (topic, people, agreed term translations; keep names and "
-                   f"terms consistent with them):\n{context.memo}")
+        system += f"\n\nConversation notes (keep names/terms consistent):\n{context.memo}"
     if context.older:
-        system += "\n\nEarlier in the conversation (source only, context only):\n" + " ".join(context.older)
+        system += "\n\nEarlier in the conversation (context only):\n" + " ".join(context.older)
     if context.recent:
         lines = "\n".join(f"- {s} => {t}" for s, t in context.recent)
         system += f"\n\nPrevious subtitles (context only, do not repeat them):\n{lines}"
@@ -73,10 +69,9 @@ _EX_ADMIN = "Okay, so, you know, let's just start with some admin and then we'll
 _EX_SLIDES = "However, I should note that I reserve the right to change the slides, and I often do."
 KO_STYLES = {
     "합니다": {
-        "rule": "Always end sentences in 합니다체 (…합니다, …습니다, …입니다, …겠습니다, …습니까?). "
-                "Never use 해요체 (…해요, …예요, …죠) or 반말.",
-        "examples": [(_EX_ADMIN, "먼저 공지 사항부터 말씀드리고 본론으로 들어가겠습니다."),
-                     (_EX_SLIDES, "다만 슬라이드는 제가 언제든 바꿀 수 있고, 실제로 자주 바꿉니다."),
+        "rule": "Always end sentences in 합니다체 (…합니다, …습니다, …겠습니다, …습니까?), never 해요체 or 반말.",
+        "examples": [("and the more data we collect without checking the", "그리고 확인도 없이 데이터를 더 많이 모을수록…"),
+                     (_EX_ADMIN, "먼저 공지 사항부터 말씀드리고 본론으로 들어가겠습니다."),
                      ("That's not a great habit, right? So what are we really talking about here?",
                       "좋은 습관은 아닙니다. 그렇다면 우리가 정말 이야기하려는 것은 무엇입니까?")],
     },

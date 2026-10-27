@@ -141,6 +141,24 @@ def test_unfinished(source, translation, unfinished):
     assert pipeline._unfinished(source, translation) is unfinished
 
 
+@pytest.mark.parametrize("source,filler", [
+    ("and", True), ("So,", True), ("you know, so...", True), ("Um.", True), ("음", True), ("", True),
+    ("I know.", False), ("Yeah.", False), ("so he's against", False), ("46", False), ("그래서 그건", False),
+])
+def test_filler_only(source, filler):
+    assert pipeline._filler_only(source) is filler
+
+
+def test_filler_fragment_is_dropped_without_a_request(running_pipeline, monkeypatch):
+    p, log = running_pipeline
+    monkeypatch.setattr(pipeline, "MERGE_WAIT_SEC", 0.05)  # nothing follows soon enough to absorb it
+    say(p, 1, "you know, so")
+    assert wait_for(lambda: ("merged", 1) in log)
+    say(p, 2, "We shipped it.")
+    assert wait_for(lambda: ("final", 2, "<We shipped it.>") in log)
+    assert ("merged", 1) in log and p.translator.sources == ["We shipped it."]
+
+
 def test_whisper_full_stop_does_not_hide_an_open_sentence(running_pipeline, monkeypatch):
     p, log = running_pipeline
     p.translator.stream = lambda text, *a, **k: iter([f"<{text}>" if text.endswith("month.") else "승인을 받는다면…"])

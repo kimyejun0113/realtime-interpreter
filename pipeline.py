@@ -101,6 +101,14 @@ def _commit_point(text: str) -> int | None:
     return None
 
 
+_FILLERS = re.compile(r"\b(?:you know|i mean|and|so|but|or|um+|uh+|like|well)\b|(?<!\w)(?:음+|어+|그|아|저)(?!\w)")
+
+
+def _filler_only(source: str) -> bool:
+    """A leftover fragment like "and", "so, um" or "you know," with nothing to translate."""
+    return not re.search(r"\w", _FILLERS.sub("", source.lower()))
+
+
 def _unfinished(source: str, translation: str) -> bool:
     """Whether a translated piece stopped mid-sentence.
 
@@ -309,7 +317,7 @@ class Pipeline:
             self.memo.reset()
         self._restart(apply)
 
-    OLDER_MAX_CHARS = 600  # cap on the source-only context, newest sentences kept
+    OLDER_MAX_CHARS = 400  # cap on the source-only context, newest sentences kept
 
     def _context(self) -> Context:
         items = list(self.history)
@@ -486,6 +494,9 @@ class Pipeline:
         while True:
             utt = self._next_final()
             source, stt_ms = self._refine_source(utt)
+            if _filler_only(source):
+                self.events.on_merged(utt.seq)  # nothing to say: drop the line instead of paying for a request
+                continue
             prev = self._take_open(utt, source)
             if prev is not None:
                 # the previous subtitle stopped mid-sentence: translate both as one sentence
