@@ -20,6 +20,8 @@ from stt.streaming import StreamingRecognizer
 from translate import local_mt
 from translate.base import Translator
 from translate import engines
+from translate.base import Context
+from translate.memo import MemoKeeper
 from translate.openai_compat import GROQ_BASE, OpenAICompatTranslator
 
 LOG_DIR = Path(__file__).with_name("logs")
@@ -123,7 +125,7 @@ class Pipeline:
         self.lang = cfg.input_lang
         self.frames: queue.Queue = queue.Queue()
         self.finals: queue.Queue = queue.Queue()
-        self.context: deque[tuple[str, str]] = deque(maxlen=3)
+        self.history: deque[tuple[str, str]] = deque(maxlen=cfg.context_recent + cfg.context_older)
         self.quota = QuotaTracker(cfg.rpm_limits)
         self.stt = GroqSTT(cfg.groq_api_key, cfg.stt_model, self.quota)
         groq_partial = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
@@ -132,6 +134,8 @@ class Pipeline:
         self.final_translators, skipped = engines.build(cfg.translate_engines, self.quota)
         if skipped:
             print(f"translation engines skipped (no API key or unknown): {', '.join(skipped)}", flush=True)
+        memo_models = [e for e in engines.build(cfg.memo_engines, self.quota)[0] if isinstance(e, OpenAICompatTranslator)]
+        self.memo = MemoKeeper(memo_models, self.quota, on_update=lambda m: print(f"[memo]\n{m}", flush=True))
         self.logger = TranscriptLogger(cfg)
 
         self.recognizer: StreamingRecognizer | None = None
@@ -227,7 +231,25 @@ class Pipeline:
         self._restart(lambda: setattr(self, "device", device))
 
     def set_lang(self, lang: str) -> None:
-        self._restart(lambda: setattr(self, "lang", lang))
+        def apply() -> None:
+            self.lang = lang
+            self.history.clear()
+            self.memo.reset()
+        self._restart(apply)
+
+    OLDER_MAX_CHARS = 600  # cap on the source-only context, newest sentences kept
+
+    def _context(self) -> Context:
+        items = list(self.history)
+        n = self.cfg.context_recent
+        recent, older = items[-n:] if n else [], items[:-n] if n else items
+        older_src, size = [], 0
+        for src, _ in reversed(older):
+            size += len(src)
+            if size > self.OLDER_MAX_CHARS:
+                break
+            older_src.insert(0, src)
+        return Context(recent=recent, older=older_src, memo=self.memo.memo if self.cfg.conversation_memo else "")
 
     # ---- workers -------------------------------------------------------
     def _asr_loop(self) -> None:
@@ -304,7 +326,7 @@ class Pipeline:
             done_seq, done_words = seq, words
             out = ""
             try:
-                for piece in translator.stream(text, self.lang, self.target_lang, [], partial=True):
+                for piece in translator.stream(text, self.lang, self.target_lang, Context(), partial=True):
                     if seq in self.finalized:
                         break
                     out += piece
@@ -322,7 +344,7 @@ class Pipeline:
             return utt.text, 0
         t0 = time.perf_counter()
         try:
-            prompt = " ".join(s for s, _ in self.context)
+            prompt = " ".join(s for s, _ in self.history)
             tr = self.stt.transcribe(utt.pcm, prompt, language=utt.lang)
             if tr:
                 return tr.text, round((time.perf_counter() - t0) * 1000)
@@ -356,7 +378,7 @@ class Pipeline:
                 if self.quota.cooldown_left(translator.name) > 0:
                     continue
                 try:
-                    for piece in translator.stream(source, utt.lang, tgt, list(self.context)):
+                    for piece in translator.stream(source, utt.lang, tgt, self._context()):
                         if first_token_ms is None:
                             first_token_ms = round((time.perf_counter() - t0) * 1000)
                         out += piece
@@ -379,7 +401,9 @@ class Pipeline:
                 self.events.on_status("Groq 한도 초과 · 로컬 번역 사용 중", "warn")
             elif self.running.is_set():
                 self.events.on_status(self.listening_label, "live")
-            self.context.append((source, out))
+            self.history.append((source, out))
+            if self.cfg.conversation_memo:
+                self.memo.add(source, out, utt.lang, tgt)
             timings = {
                 "stt_ms": stt_ms,
                 "first_token_ms": first_token_ms or 0,

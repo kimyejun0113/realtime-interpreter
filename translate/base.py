@@ -1,18 +1,31 @@
 import os
+from dataclasses import dataclass, field
 from typing import Iterator
 
 from config import lang_name
+
+
+@dataclass
+class Context:
+    """What the translator knows about the conversation so far, sized to keep prompts small."""
+
+    recent: list[tuple[str, str]] = field(default_factory=list)  # last sentences: (source, translation)
+    older: list[str] = field(default_factory=list)               # sentences before those: source only
+    memo: str = ""                                               # running notes: topic, people, terms
+
+    def sources(self) -> list[str]:
+        return [*self.older, *(s for s, _ in self.recent)]
 
 
 class Translator:
     model: str
     name: str  # unique key for quota tracking
 
-    def stream(self, text: str, src: str, tgt: str, context: list[tuple[str, str]], partial: bool = False) -> Iterator[str]:
+    def stream(self, text: str, src: str, tgt: str, context: Context, partial: bool = False) -> Iterator[str]:
         raise NotImplementedError
 
 
-def build_messages(text: str, src: str, tgt: str, context: list[tuple[str, str]], partial: bool = False) -> list[dict]:
+def build_messages(text: str, src: str, tgt: str, context: Context, partial: bool = False) -> list[dict]:
     if partial:
         # short prompt: partial updates are frequent, so every token counts
         system = (
@@ -41,8 +54,13 @@ def build_messages(text: str, src: str, tgt: str, context: list[tuple[str, str]]
     style = KO_STYLES.get(KO_STYLE, KO_STYLES["합니다"])
     if tgt == "ko":
         system += "\n- " + style["rule"]
-    if context:
-        lines = "\n".join(f"- {s} => {t}" for s, t in context)
+    if context.memo:
+        system += ("\n\nConversation notes (topic, people, agreed term translations; keep names and "
+                   f"terms consistent with them):\n{context.memo}")
+    if context.older:
+        system += "\n\nEarlier in the conversation (source only, context only):\n" + " ".join(context.older)
+    if context.recent:
+        lines = "\n".join(f"- {s} => {t}" for s, t in context.recent)
         system += f"\n\nPrevious subtitles (context only, do not repeat them):\n{lines}"
     # a couple of worked examples hold the style (register, filler removal) far better than rules alone
     examples = style["examples"] if tgt == "ko" else []

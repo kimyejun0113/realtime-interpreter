@@ -29,6 +29,13 @@ class Config:
     translate_engines: str = _env(
         "TRANSLATE_ENGINES", "groq:openai/gpt-oss-120b, groq:qwen/qwen3.8-27b, groq:openai/gpt-oss-20b"
     )
+    # conversation memory: last CONTEXT_RECENT sentences go along with translations in full,
+    # the CONTEXT_OLDER before them as source text only, plus running notes (topic, people, terms)
+    # condensed every few sentences by MEMO_ENGINES (cheap models, separate quotas)
+    context_recent: int = int(_env("CONTEXT_RECENT", "2"))
+    context_older: int = int(_env("CONTEXT_OLDER", "6"))
+    conversation_memo: bool = _env("CONVERSATION_MEMO", "1") == "1"
+    memo_engines: str = _env("MEMO_ENGINES", "groq:qwen/qwen3.8-27b, groq:openai/gpt-oss-20b")
     partial_model: str = _env("PARTIAL_MODEL", "openai/gpt-oss-20b")
     # live (partial) re-translation while still speaking.
     # local: NLLB on this PC, unlimited. groq: PARTIAL_MODEL, uses quota

@@ -28,25 +28,27 @@ class OpenAICompatTranslator(Translator):
             headers={"Authorization": f"Bearer {api_key}", **(extra_headers or {})}, timeout=20.0
         )
 
+    def complete(self, messages: list[dict], max_tokens: int = 250) -> str:
+        """One non-streamed answer (used for the conversation memo)."""
+        payload = self._tune({"model": self.model, "messages": messages, "temperature": 0.1, "max_tokens": max_tokens})
+        if self.quota:
+            self.quota.record_request(self.name)
+        resp = self.client.post(self.url, json=payload)
+        if self.quota:
+            self.quota.update(self.name, resp)
+        if resp.status_code == 429:
+            raise RateLimitError(resp.text)
+        resp.raise_for_status()
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
     def stream(self, text, src, tgt, context, partial=False) -> Iterator[str]:
-        payload = {
+        payload = self._tune({
             "model": self.model,
             "messages": build_messages(text, src, tgt, context, partial),
             "temperature": 0.1,
             "max_tokens": 300 if partial else 500,
             "stream": True,
-        }
-        model = self.model.rsplit("/", 1)[-1]
-        # reasoning models think before answering; keep it minimal for latency and tokens
-        if model.startswith("gpt-oss"):
-            payload["reasoning_effort"] = "low"
-        elif model.startswith("qwen3") and self.provider == "groq":
-            payload["reasoning_effort"] = "none"
-        if self.provider == "openai" and model.startswith(("gpt-5", "o1", "o3", "o4")):
-            # OpenAI reasoning models: no custom temperature, token cap has a different name
-            payload.pop("temperature")
-            payload["max_completion_tokens"] = payload.pop("max_tokens") + 1000
-            payload["reasoning_effort"] = "minimal" if model.startswith("gpt-5") else "low"
+        })
         if self.quota:
             self.quota.record_request(self.name)
         with self.client.stream("POST", self.url, json=payload) as resp:
@@ -70,3 +72,17 @@ class OpenAICompatTranslator(Translator):
                     delta = choices[0].get("delta", {}).get("content")
                     if delta:
                         yield delta
+
+    def _tune(self, payload: dict) -> dict:
+        model = self.model.rsplit("/", 1)[-1]
+        # reasoning models think before answering; keep it minimal for latency and tokens
+        if model.startswith("gpt-oss"):
+            payload["reasoning_effort"] = "low"
+        elif model.startswith("qwen3") and self.provider == "groq":
+            payload["reasoning_effort"] = "none"
+        if self.provider == "openai" and model.startswith(("gpt-5", "o1", "o3", "o4")):
+            # OpenAI reasoning models: no custom temperature, token cap has a different name
+            payload.pop("temperature")
+            payload["max_completion_tokens"] = payload.pop("max_tokens") + 1000
+            payload["reasoning_effort"] = "minimal" if model.startswith("gpt-5") else "low"
+        return payload

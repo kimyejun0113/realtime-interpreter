@@ -37,8 +37,8 @@ class DeepLTranslator(Translator):
             "source_lang": DEEPL_LANGS.get(src, "EN").split("-")[0],
             "target_lang": DEEPL_LANGS.get(tgt, "KO"),
         }
-        if context:  # earlier sentences help pronouns and terms; not translated or billed
-            payload["context"] = " ".join(s for s, _ in context)
+        if context.sources():  # earlier sentences help pronouns and terms; not translated or billed
+            payload["context"] = " ".join(context.sources())
         resp = self.client.post(self.url, json=payload)
         if self.quota:
             self.quota.update(self.name, resp)
