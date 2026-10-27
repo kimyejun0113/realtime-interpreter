@@ -14,13 +14,19 @@ OPENAI_BASE = "https://api.openai.com/v1"
 
 
 class OpenAICompatTranslator(Translator):
-    """Streaming translation over any OpenAI-compatible chat endpoint (Groq, Gemini)."""
+    """Streaming translation over any OpenAI-compatible chat endpoint (Groq, Gemini, OpenAI, …)."""
 
-    def __init__(self, base_url: str, api_key: str, model: str, quota: QuotaTracker | None = None):
+    def __init__(self, base_url: str, api_key: str, model: str, quota: QuotaTracker | None = None,
+                 provider: str = "groq", extra_headers: dict | None = None):
         self.url = f"{base_url}/chat/completions"
         self.model = model
+        self.provider = provider
+        # quota bookkeeping key; Groq keeps the bare model name so its RPM table applies
+        self.name = model if provider == "groq" else f"{provider}:{model}"
         self.quota = quota
-        self.client = httpx.Client(headers={"Authorization": f"Bearer {api_key}"}, timeout=20.0)
+        self.client = httpx.Client(
+            headers={"Authorization": f"Bearer {api_key}", **(extra_headers or {})}, timeout=20.0
+        )
 
     def stream(self, text, src, tgt, context, partial=False) -> Iterator[str]:
         payload = {
@@ -30,16 +36,22 @@ class OpenAICompatTranslator(Translator):
             "max_tokens": 300 if partial else 500,
             "stream": True,
         }
+        model = self.model.rsplit("/", 1)[-1]
         # reasoning models think before answering; keep it minimal for latency and tokens
-        if self.model.startswith("openai/gpt-oss"):
+        if model.startswith("gpt-oss"):
             payload["reasoning_effort"] = "low"
-        elif self.model.startswith("qwen/qwen3"):
+        elif model.startswith("qwen3") and self.provider == "groq":
             payload["reasoning_effort"] = "none"
+        if self.provider == "openai" and model.startswith(("gpt-5", "o1", "o3", "o4")):
+            # OpenAI reasoning models: no custom temperature, token cap has a different name
+            payload.pop("temperature")
+            payload["max_completion_tokens"] = payload.pop("max_tokens") + 1000
+            payload["reasoning_effort"] = "minimal" if model.startswith("gpt-5") else "low"
         if self.quota:
-            self.quota.record_request(self.model)
+            self.quota.record_request(self.name)
         with self.client.stream("POST", self.url, json=payload) as resp:
             if self.quota:
-                self.quota.update(self.model, resp)
+                self.quota.update(self.name, resp)
             if resp.status_code == 429:
                 raise RateLimitError(resp.read().decode(errors="replace"))
             if resp.status_code >= 400:

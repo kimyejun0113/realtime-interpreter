@@ -5,6 +5,7 @@ from config import lang_name
 
 class Translator:
     model: str
+    name: str  # unique key for quota tracking
 
     def stream(self, text: str, src: str, tgt: str, context: list[tuple[str, str]], partial: bool = False) -> Iterator[str]:
         raise NotImplementedError

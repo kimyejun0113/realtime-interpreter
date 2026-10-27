@@ -23,12 +23,11 @@ class Config:
     final_stt: str = _env("FINAL_STT", "groq").lower()
     stt_model: str = _env("STT_MODEL", "whisper-large-v3-turbo")
 
-    # finished sentences: Groq model, then fallbacks in order when it is rate-limited (each has its own quota).
-    # Qwen: natural Korean, ~0.4 s, no reasoning tokens -> the daily token quota lasts much longer
-    translate_model: str = _env("TRANSLATE_MODEL", "qwen/qwen3.8-27b")
-    fallback_models: list = field(default_factory=lambda: [
-        m.strip() for m in _env("FALLBACK_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b").split(",") if m.strip()
-    ])
+    # finished sentences: engines tried in order, skipping any without an API key (see translate/engines.py).
+    # Qwen first: natural Korean, ~0.4 s, no reasoning tokens -> the daily token quota lasts longer
+    translate_engines: str = _env(
+        "TRANSLATE_ENGINES", "groq:qwen/qwen3.8-27b, groq:openai/gpt-oss-120b, groq:openai/gpt-oss-20b"
+    )
     partial_model: str = _env("PARTIAL_MODEL", "openai/gpt-oss-20b")
     # live (partial) re-translation while still speaking.
     # local: NLLB on this PC, unlimited. groq: PARTIAL_MODEL, uses quota
@@ -36,14 +35,6 @@ class Config:
     partial_engine: str = _env("PARTIAL_ENGINE", "local").lower()
     partial_interval_sec: float = float(_env("PARTIAL_INTERVAL_SEC", "0.6" if partial_engine == "local" else "2.0"))
     partial_min_new_words: int = int(_env("PARTIAL_MIN_NEW_WORDS", "1" if partial_engine == "local" else "4"))
-
-    # optional paid engine: when a key is set it translates finished sentences first (Groq becomes the fallback)
-    openai_api_key: str = _env("OPENAI_API_KEY", "")
-    openai_model: str = _env("OPENAI_MODEL", "gpt-4o-mini")
-
-    # optional extra fallback when Groq is rate-limited
-    gemini_api_key: str = _env("GEMINI_API_KEY", "")
-    gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
 
     main_target_lang: str = _env("MAIN_TARGET_LANG", "ko")
     other_lang: str = _env("OTHER_LANG", "en")

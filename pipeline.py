@@ -19,7 +19,8 @@ from stt.groq_stt import GroqSTT
 from stt.streaming import StreamingRecognizer
 from translate import local_mt
 from translate.base import Translator
-from translate.openai_compat import GEMINI_BASE, GROQ_BASE, OPENAI_BASE, OpenAICompatTranslator
+from translate import engines
+from translate.openai_compat import GROQ_BASE, OpenAICompatTranslator
 
 LOG_DIR = Path(__file__).with_name("logs")
 
@@ -127,15 +128,10 @@ class Pipeline:
         self.stt = GroqSTT(cfg.groq_api_key, cfg.stt_model, self.quota)
         groq_partial = OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, cfg.partial_model, self.quota)
         self.partial_translator: Translator | None = None if cfg.partial_engine == "local" else groq_partial
-        # tried in order for finished sentences; each Groq model has its own quota
-        self.final_translators: list[Translator] = [
-            OpenAICompatTranslator(GROQ_BASE, cfg.groq_api_key, model, self.quota)
-            for model in dict.fromkeys([cfg.translate_model, *cfg.fallback_models])
-        ]
-        if cfg.openai_api_key:
-            self.final_translators.insert(0, OpenAICompatTranslator(OPENAI_BASE, cfg.openai_api_key, cfg.openai_model))
-        if cfg.gemini_api_key:
-            self.final_translators.append(OpenAICompatTranslator(GEMINI_BASE, cfg.gemini_api_key, cfg.gemini_model))
+        # tried in order for finished sentences; engines without an API key are skipped
+        self.final_translators, skipped = engines.build(cfg.translate_engines, self.quota)
+        if skipped:
+            print(f"translation engines skipped (no API key or unknown): {', '.join(skipped)}", flush=True)
         self.logger = TranscriptLogger(cfg)
 
         self.recognizer: StreamingRecognizer | None = None
@@ -301,7 +297,7 @@ class Pipeline:
                 continue
             # API engine: keep 30% of the daily quota and per-minute headroom for finished sentences
             if isinstance(translator, OpenAICompatTranslator) and not self.quota.can_use(
-                translator.model, min_tokens=1500, keep_day_ratio=0.3
+                translator.name, min_tokens=1500, keep_day_ratio=0.3
             ):
                 continue
             last_call = time.time()
@@ -357,7 +353,7 @@ class Pipeline:
             t0 = time.perf_counter()
             out, used, first_token_ms = "", None, None
             for translator in self.final_translators:
-                if self.quota.cooldown_left(translator.model) > 0:
+                if self.quota.cooldown_left(translator.name) > 0:
                     continue
                 try:
                     for piece in translator.stream(source, utt.lang, tgt, list(self.context)):
@@ -398,11 +394,8 @@ class Pipeline:
                 self.events.on_status(f"로그 저장 실패: {e}", "warn")
 
     def _quota_loop(self) -> None:
-        labels = {
-            self.cfg.translate_model: "번역",
-            **{m: "예비" + str(i + 1) for i, m in enumerate(self.cfg.fallback_models)},
-            self.cfg.stt_model: "인식",
-        }
+        labels = {e.name: engines.label(e) for e in self.final_translators[:3]}
+        labels[self.cfg.stt_model] = "인식"
         while True:
             time.sleep(2)
             self.events.on_quota(self.quota.summary(labels))

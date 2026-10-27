@@ -18,7 +18,7 @@ def available() -> bool:
 
 
 class LocalTranslator(Translator):
-    model = "local-nllb"
+    model = name = "local-nllb"
 
     def __init__(self, threads: int = 4):
         import ctranslate2
