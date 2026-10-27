@@ -17,6 +17,9 @@
 - Claude 데스크톱 앱에서 `%APPDATA%`에 쓰면 샌드박스 가상 폴더로 간다. 실행에 필요한 것은 프로젝트 폴더 안에 둔다. 실제 실행 확인은 `explorer.exe` 로 바탕화면 바로가기를 연다.
 - 모델은 `python download_models.py`(models/, git 제외). API 키는 `.env`(git 제외).
 
+## 해 봤는데 안 된 것 (다시 시도하기 전에 읽기)
+- **인식기 핫워드(용어 힌트, 2026-10-27):** sherpa-onnx `modified_beam_search` + `hotwords_file`/`create_stream(hotwords)`. Kroko 배포판에는 `bpe.model`이 없어서 `tokens.txt`로 `bpe_vocab`을 흉내 냈다. 점수 0이면 효과가 전혀 없었고(score 6까지), 길이 가중 점수를 주면 문장 가운데가 통째로 사라지는 등 오히려 망가졌다. RTF는 0.09에서 0.12로 문제없었다. 다시 하려면 원본 BPE 모델이 있는 영어 모델로 바꿔야 한다. 지금은 이름·용어 통일을 번역 쪽 대화 메모 용어집과 Whisper 다듬기로 대신한다.
+
 ## 커밋 전
 ```
 .venv\Scripts\python -m pytest -q
