@@ -73,6 +73,7 @@ class SubtitleOverlay(QWidget):
         self.font_size = int(self.settings.value("font_size", 24))
         self.bg_alpha = int(self.settings.value("bg_alpha", 215))
         self.entries: OrderedDict[int, dict] = OrderedDict()
+        self._merged: set[int] = set()  # lines folded into a later one; late updates for them are ignored
         self._drag_from: QPoint | None = None
         self.on_toggle = lambda: None   # set by main
         self.on_menu = lambda pos: None
@@ -291,6 +292,8 @@ class SubtitleOverlay(QWidget):
         return super().eventFilter(obj, event)
 
     def on_live(self, seq: int, text: str) -> None:
+        if seq in self._merged:
+            return
         e = self._entry(seq)
         if not e["done"]:
             e["source"] = text
@@ -303,6 +306,8 @@ class SubtitleOverlay(QWidget):
             self._render()
 
     def on_source(self, seq: int, text: str, lang: str) -> None:
+        if seq in self._merged:  # e.g. a spacing fix arriving after the line was merged
+            return
         self._entry(seq)["source"] = text
         self._render()
 
@@ -317,6 +322,7 @@ class SubtitleOverlay(QWidget):
 
     def on_merged(self, seq: int) -> None:
         # this piece is being translated together with the next one, which shows the combined text
+        self._merged.add(seq)
         if self.entries.pop(seq, None) is not None:
             self._render()
 

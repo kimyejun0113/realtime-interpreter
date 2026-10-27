@@ -49,6 +49,16 @@ class Events:
 
 
 @dataclass
+class OpenSentence:
+    """A translated piece that ended mid-sentence, waiting to be completed by the next one."""
+    seq: int
+    source: str
+    translation: str
+    lang: str
+    at: float
+
+
+@dataclass
 class Utterance:
     seq: int
     text: str
@@ -66,6 +76,8 @@ SOFT_CUT_WORDS = 25  # past this, a comma is good enough to finalise
 HARD_CUT_WORDS = 40  # past this, cut anyway (fast speech with no punctuation)
 SHORT_FRAGMENT_WORDS = 6  # an unfinished piece shorter than this is joined to the next one
 MERGE_WAIT_SEC = 3.0      # ...if the next one arrives within this time
+OPEN_SENTENCE_SEC = 8.0   # a translated piece that stopped mid-sentence is re-translated with the next
+MERGE_MAX_WORDS = 40      # ...piece if it comes within this time and the two stay this short
 
 
 def _commit_point(text: str) -> int | None:
@@ -87,6 +99,17 @@ def _commit_point(text: str) -> int | None:
         keep_open = 4  # the newest words may still be revised by the recogniser
         return len(text) - len(" ".join(words[-keep_open:]))
     return None
+
+
+def _unfinished(source: str, translation: str) -> bool:
+    """Whether a translated piece stopped mid-sentence.
+
+    The translation is the best judge: the prompt makes it end an unfinished input with "…",
+    while Whisper happily puts a full stop on half a sentence.
+    """
+    ends_open = ("…", "...")
+    return (translation.rstrip().endswith(ends_open) or source.rstrip().endswith(ends_open)
+            or not _SENTENCE_FINAL.search(source))
 
 
 def _written_in(text: str, lang: str) -> bool:
@@ -170,6 +193,7 @@ class Pipeline:
         if local_mt.available():
             threading.Thread(target=self._load_local_mt, daemon=True).start()
         self.finalized: set[int] = set()
+        self._open: OpenSentence | None = None
         self._live = (0, "")          # latest (seq, text) for the partial translator
         self._live_cond = threading.Condition()
 
@@ -425,10 +449,51 @@ class Pipeline:
         if spaced:
             self.events.on_source(seq, spaced, "ko")
 
+    def _translate(self, seq: int, source: str, lang: str, tgt: str) -> tuple[str, str | None, int | None]:
+        """Final translation through the engine list. Returns (text, engine used or None, first-token ms)."""
+        t0 = time.perf_counter()
+        out, first_token_ms = "", None
+        for translator in self.final_translators:
+            if self.quota.cooldown_left(translator.name) > 0:
+                continue
+            try:
+                for piece in translator.stream(source, lang, tgt, self._context()):
+                    if first_token_ms is None:
+                        first_token_ms = round((time.perf_counter() - t0) * 1000)
+                    out += piece
+                    self.events.on_partial(seq, out)
+                return out.strip(), translator.model, first_token_ms
+            except RateLimitError:
+                out = ""
+            except Exception as e:
+                self.events.on_status(f"번역 오류: {str(e)[:80]}", "warn")
+                out = ""
+        return "", None, first_token_ms
+
+    def _take_open(self, utt: Utterance, source: str) -> "OpenSentence | None":
+        """The previous unfinished sentence, if this piece should complete it."""
+        prev, self._open = self._open, None
+        if prev is None:
+            return None
+        if (prev.lang == utt.lang and time.monotonic() - prev.at <= OPEN_SENTENCE_SEC
+                and len(prev.source.split()) + len(source.split()) <= MERGE_MAX_WORDS):
+            return prev
+        if self.cfg.conversation_memo:  # not continued after all: it goes into the notes as it is
+            self.memo.add(prev.source, prev.translation, prev.lang, self.target_for(prev.lang))
+        return None
+
     def _final_loop(self) -> None:
         while True:
             utt = self._next_final()
             source, stt_ms = self._refine_source(utt)
+            prev = self._take_open(utt, source)
+            if prev is not None:
+                # the previous subtitle stopped mid-sentence: translate both as one sentence
+                # and let this line replace it (Korean puts the verb last, so halves read badly)
+                self.events.on_merged(prev.seq)
+                if self.history and self.history[-1] == (prev.source, prev.translation):
+                    self.history.pop()
+                source = f"{prev.source} {source}"
             self.events.on_source(utt.seq, source, utt.lang)
             if utt.lang == "ko" and spacing.needs_spacing(source):
                 # display only: translate right away, put the spaced text on screen when it arrives
@@ -436,26 +501,7 @@ class Pipeline:
             tgt = self.target_for(utt.lang)
 
             t0 = time.perf_counter()
-            out, used, first_token_ms = "", None, None
-            for translator in self.final_translators:
-                if self.quota.cooldown_left(translator.name) > 0:
-                    continue
-                try:
-                    for piece in translator.stream(source, utt.lang, tgt, self._context()):
-                        if first_token_ms is None:
-                            first_token_ms = round((time.perf_counter() - t0) * 1000)
-                        out += piece
-                        self.events.on_partial(utt.seq, out)
-                    used = translator.model
-                    break
-                except RateLimitError:
-                    out = ""
-                    continue
-                except Exception as e:
-                    self.events.on_status(f"번역 오류: {str(e)[:80]}", "warn")
-                    out = ""
-                    continue
-            out = out.strip()
+            out, used, first_token_ms = self._translate(utt.seq, source, utt.lang, tgt)
             self.events.on_final(utt.seq, out)
             if used is None:
                 self.events.on_status("번역 한도 초과 · 원문만 표시 중", "warn")
@@ -465,7 +511,10 @@ class Pipeline:
             elif self.running.is_set():
                 self.events.on_status(self.listening_label, "live")
             self.history.append((source, out))
-            if self.cfg.conversation_memo:
+            if prev is None and _unfinished(source, out):
+                # may be completed by the next piece; it reaches the notes once that's decided
+                self._open = OpenSentence(utt.seq, source, out, utt.lang, time.monotonic())
+            elif self.cfg.conversation_memo:
                 self.memo.add(source, out, utt.lang, tgt)
             timings = {
                 "stt_ms": stt_ms,
@@ -474,6 +523,8 @@ class Pipeline:
                 "latency_ms": round((t0 - utt.t_end) * 1000 + (first_token_ms or 0)),
                 "model": used,
             }
+            if prev is not None:
+                timings["completes"] = prev.seq
             print(f"[{utt.seq}] {utt.lang}->{tgt} {timings}  {source!r} => {out!r}", flush=True)
             try:
                 self.logger.write(utt, source, out, tgt, timings)
