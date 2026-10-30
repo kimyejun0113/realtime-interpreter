@@ -7,7 +7,7 @@
 - `pipeline.py`: 오디오 → 로컬 스트리밍 음성인식 → 문장 분할(`_commit_point`), 짧은 조각 합치기(`_next_final`) → 임시 번역(로컬 NLLB) / 최종 번역(엔진 목록) → 기록
 - `audio/capture.py`: 마이크, PC 소리(WASAPI 루프백 + 자동 음량), 앱 소리(`app_loopback.py`, 프로세스 루프백), WAV 파일 입력
 - `stt/streaming.py`: sherpa-onnx 스트리밍 인식(영어 Kroko, 한국어 zipformer). `DualRecognizer`가 자동 모드에서 두 모델을 동시에 돌려 최근 토큰 확신도(`ys_probs`)로 언어를 고른다. 임계값은 tests/test_dual.py와 실제 녹음으로 맞춘 값이라 바꾸면 둘 다 다시 확인
-- `translate/`: `base.py` 프롬프트(KO_STYLE, Context), `engines.py` 엔진 목록(.env `TRANSLATE_ENGINES`), `openai_compat.py` LLM, `mt_services.py` DeepL/Azure, `local_mt.py` NLLB, `memo.py` 대화 메모
+- `translate/`: `base.py` 프롬프트(KO_STYLE, Context), `engines.py` 엔진 목록(.env `TRANSLATE_ENGINES`), `openai_compat.py` LLM, `mt_services.py` DeepL/Azure, `local_mt.py` NLLB, `memo.py` 대화 메모, `glossary.py` 사용자 용어집(`glossary.txt`, git 제외: Whisper 힌트 + 번역 프롬프트 + 잘못 들은 단어 짚기)
 - `quota.py`: 응답 헤더로 무료 한도를 추적해 미리 속도를 줄임
 - `ui/overlay.py`: 자막 창(문장 유지 시간, 창에 맞춰 줄이기), `ui/settings.py` 메뉴
 
@@ -20,7 +20,9 @@
 ## 해 봤는데 안 된 것 (다시 시도하기 전에 읽기)
 - **인식기 핫워드(용어 힌트, 2026-10-27):** sherpa-onnx `modified_beam_search` + `hotwords_file`/`create_stream(hotwords)`. Kroko 배포판에는 `bpe.model`이 없어서 `tokens.txt`로 `bpe_vocab`을 흉내 냈다. 점수 0이면 효과가 전혀 없었고(score 6까지), 길이 가중 점수를 주면 문장 가운데가 통째로 사라지는 등 오히려 망가졌다. RTF는 0.09에서 0.12로 문제없었다. 다시 하려면 원본 BPE 모델이 있는 영어 모델로 바꿔야 한다. 지금은 이름·용어 통일을 번역 쪽 대화 메모 용어집과 Whisper 다듬기로 대신한다.
 
-- **Whisper 프롬프트에 대화 메모의 이름·용어 힌트(2026-10-27):** 메모는 인식 결과로 만들어져서 틀린 철자("Elyna Park", "Grok")가 들어가고, 힌트가 그 오류를 굳혔다. 15문장 이름 위주 강연에서 Elena Park 정답률이 힌트 없음 3/3에서 힌트 있음 3/7로 떨어졌고, Groq·Kubernetes·Raghunathan은 둘 다 못 맞혔다. 효과를 보려면 사용자가 **올바른 철자를 직접 적은 용어집**을 힌트로 줘야 한다.
+- **Whisper 프롬프트에 대화 메모의 이름·용어 힌트(2026-10-27):** 메모는 인식 결과로 만들어져서 틀린 철자("Elyna Park", "Grok")가 들어가고, 힌트가 그 오류를 굳혔다. 15문장 이름 위주 강연에서 Elena Park 정답률이 힌트 없음 3/3에서 힌트 있음 3/7로 떨어졌고, Groq·Kubernetes·Raghunathan은 둘 다 못 맞혔다. 효과를 보려면 사용자가 **올바른 철자를 직접 적은 용어집**을 힌트로 줘야 한다. → 용어집으로 구현함(2026-10-30).
+
+- **번역 프롬프트에 "비슷하게 들리는 단어는 용어로 읽어라"만 적기(2026-10-30):** 120b·Qwen 모두 잘못 들은 이름("Killy", "Stillion")을 거의 고치지 않았다(13개 중 4~5개). 입력에서 의심 단어를 짚어 주면 고치지만, 평범한 단어("silly", "thrill")를 짚으면 그대로 따라 "정말 틸리였습니다"처럼 망가진다. 그래서 `Glossary.suspects`는 wordfreq 빈도(zipf ≥ 3, 문장 중간 대문자면 ≥ 5)로 평범한 단어를 거른다. 문턱을 바꾸면 tests/test_glossary.py와 10-28 로그로 다시 확인
 
 ## 커밋 전
 ```

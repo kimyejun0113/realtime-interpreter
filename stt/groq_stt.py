@@ -19,7 +19,7 @@ class GroqSTT(STT):
     def transcribe(self, pcm: np.ndarray, prompt: str = "", language: str = "") -> Transcript | None:
         data = {"model": self.model, "response_format": "verbose_json", "temperature": "0"}
         if prompt:
-            data["prompt"] = prompt[-200:]
+            data["prompt"] = prompt[-600:]  # the caller keeps it near Whisper's ~224-token window
         if language:
             data["language"] = language
         if self.quota:

@@ -25,10 +25,12 @@ from translate import local_mt
 from translate.base import Translator
 from translate import engines, spacing
 from translate.base import Context
+from translate.glossary import Glossary
 from translate.memo import MemoKeeper
 from translate.openai_compat import GROQ_BASE, OpenAICompatTranslator
 
 LOG_DIR = Path(__file__).with_name("logs")
+WHISPER_HISTORY_CHARS = 200  # recent sentences after the glossary hint (Whisper reads up to ~224 tokens)
 AUTO = "auto"            # input language mode: detect English/Korean per sentence
 AUTO_LANGS = ("en", "ko")
 
@@ -189,6 +191,7 @@ class Pipeline:
         if skipped:
             print(f"translation engines skipped (no API key or unknown): {', '.join(skipped)}", flush=True)
         memo_models = [e for e in engines.build(cfg.memo_engines, self.quota)[0] if isinstance(e, OpenAICompatTranslator)]
+        self.glossary = Glossary()
         self.memo = MemoKeeper(memo_models, self.quota, on_update=lambda m: print(f"[memo]\n{m}", flush=True))
         self.logger = TranscriptLogger(cfg)
 
@@ -329,7 +332,8 @@ class Pipeline:
             if size > self.OLDER_MAX_CHARS:
                 break
             older_src.insert(0, src)
-        return Context(recent=recent, older=older_src, memo=self.memo.memo if self.cfg.conversation_memo else "")
+        return Context(recent=recent, older=older_src, memo=self.memo.memo if self.cfg.conversation_memo else "",
+                       glossary=self.glossary.prompt_lines())
 
     # ---- workers -------------------------------------------------------
     def _asr_loop(self) -> None:
@@ -430,8 +434,11 @@ class Pipeline:
         t0 = time.perf_counter()
         try:
             # earlier sentences in another language push Whisper into translating instead of transcribing
-            prompt = " ".join(s for s, _ in self.history if _written_in(s, utt.lang))
-            tr = self.stt.transcribe(utt.pcm, prompt, language=utt.lang)
+            prompt = " ".join(s for s, _ in self.history if _written_in(s, utt.lang))[-WHISPER_HISTORY_CHARS:]
+            # the user's glossary goes first: correct spellings Whisper should prefer (the memo is
+            # not used here, it carries recognition errors - see CLAUDE.md)
+            hint = self.glossary.whisper_hint(utt.lang)
+            tr = self.stt.transcribe(utt.pcm, f"{hint} {prompt}".strip(), language=utt.lang)
             # Whisper polishes; it must not rewrite (it can echo its prompt or translate instead)
             if tr and _written_in(tr.text, utt.lang) and _similar(tr.text, utt.text):
                 return tr.text, round((time.perf_counter() - t0) * 1000)
@@ -465,7 +472,9 @@ class Pipeline:
             if self.quota.cooldown_left(translator.name) > 0:
                 continue
             try:
-                for piece in translator.stream(source, lang, tgt, self._context()):
+                ctx = self._context()
+                ctx.suspects = self.glossary.suspects(source)
+                for piece in translator.stream(source, lang, tgt, ctx):
                     if first_token_ms is None:
                         first_token_ms = round((time.perf_counter() - t0) * 1000)
                     out += piece

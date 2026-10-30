@@ -12,3 +12,4 @@ pycaw>=20240316
 psutil>=5.9
 httpx>=0.27
 python-dotenv>=1.0
+wordfreq

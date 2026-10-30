@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QMenu
 from audio.capture import APP_PREFIX, SYSTEM_AUDIO, list_audio_apps, list_input_devices
 from pipeline import LOG_DIR
 from stt.streaming import model_available
+from translate import glossary
 
 MENU_STYLE = """
 QMenu { background: rgba(44,44,46,245); border: 1px solid rgba(255,255,255,0.10);
@@ -110,6 +111,8 @@ def build_menu(overlay, pipeline) -> QMenu:
     menu.addMenu(bg_menu)
 
     menu.addSeparator()
+    n = len(pipeline.glossary.terms)
+    menu.addAction(f"용어집 편집… ({n}개)" if n else "용어집 편집…").triggered.connect(lambda: glossary.open_in_editor())
     menu.addAction("통역 기록 폴더 열기").triggered.connect(lambda: (LOG_DIR.mkdir(exist_ok=True), os.startfile(LOG_DIR)))
     menu.addSeparator()
     menu.addAction("종료").triggered.connect(overlay.close)

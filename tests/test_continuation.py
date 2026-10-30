@@ -3,6 +3,7 @@ import queue
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ import pytest
 import pipeline
 from pipeline import Events, Pipeline, Utterance
 from quota import QuotaTracker
+from translate.glossary import Glossary
 
 
 class EchoTranslator:
@@ -46,6 +48,7 @@ def running_pipeline():
     p.final_translators = [p.translator]
     p.history = deque(maxlen=8)
     p.memo = FakeMemo()
+    p.glossary = Glossary(Path("no-glossary.txt"))
     p._open = None
     p.logger = SimpleNamespace(write=lambda *a, **k: None)
     p.running = threading.Event()

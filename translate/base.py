@@ -12,6 +12,8 @@ class Context:
     recent: list[tuple[str, str]] = field(default_factory=list)  # last sentences: (source, translation)
     older: list[str] = field(default_factory=list)               # sentences before those: source only
     memo: str = ""                                               # running notes: topic, people, terms
+    glossary: list[str] = field(default_factory=list)            # user-written terms: "Tilly = 틸리"
+    suspects: list[tuple[str, str]] = field(default_factory=list)  # words in this input that may be a term
 
     def sources(self) -> list[str]:
         return [*self.older, *(s for s, _ in self.recent)]
@@ -51,6 +53,14 @@ def build_messages(text: str, src: str, tgt: str, context: Context, partial: boo
     style = KO_STYLES.get(KO_STYLE, KO_STYLES["합니다"])
     if tgt == "ko":
         system += "\n- " + style["rule"]
+    if context.glossary:
+        system += ("\n\nGlossary of names and terms in this talk (use these spellings and translations):\n"
+                   + "\n".join(f"- {g}" for g in context.glossary)
+                   + "\nSpeech recognition often turns these terms into sound-alike words. When a word sounds "
+                   "like a glossary term and makes little sense where it is, translate it as that term.")
+        if context.suspects:
+            system += ("\nPossibly misheard in this input (use the term only where the word as heard makes no sense): "
+                       + ", ".join(f'"{h}" → {t}' for h, t in context.suspects))
     if context.memo:
         system += f"\n\nConversation notes (keep names/terms consistent):\n{context.memo}"
     if context.older:

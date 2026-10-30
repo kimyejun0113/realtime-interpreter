@@ -1,9 +1,11 @@
 import time
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 from pipeline import Pipeline
 from quota import QuotaTracker
+from translate.glossary import Glossary
 from translate import memo as memo_mod
 from translate.memo import MemoKeeper
 
@@ -13,6 +15,7 @@ def pipeline_with_history(pairs, recent=2, older=6, memo=""):
     p.cfg = SimpleNamespace(context_recent=recent, context_older=older, conversation_memo=True)
     p.history = deque(pairs, maxlen=recent + older)
     p.memo = SimpleNamespace(memo=memo)
+    p.glossary = Glossary(Path("no-glossary.txt"))
     return p
 
 
